@@ -1,0 +1,6 @@
+[profile.default]
+fail-fast = true
+failure-output = "immediate"
+retries = 0
+slow-timeout = "60s"
+threads-required = "num-cpus"

@@ -1,0 +1,29 @@
+[package]
+name = "ingot-engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ingot-connectivity = { version = "0.1.0", path = "../ingot-connectivity" }
+ingot-core = { version = "0.1.0", path = "../ingot-core" }
+ingot-primitives = { version = "0.1.0", path = "../ingot-primitives" }
+rust_decimal.workspace = true
+smallvec.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+criterion.workspace = true
+ingot-connectivity = { version = "0.1.0", path = "../ingot-connectivity" }
+rust_decimal.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "strategy_dispatch"
+harness = false
+
+[lints]
+workspace = true

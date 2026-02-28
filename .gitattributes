@@ -1,0 +1,12 @@
+# Enforce LF (Linux) line endings for all text files
+* text=auto eol=lf
+
+# Explicitly force specific extensions just to be safe
+*.rs text eol=lf
+*.sql text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf

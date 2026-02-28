@@ -1,0 +1,33 @@
+[package]
+name = "ingot-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+iceoryx2.workspace = true
+ingot-config = { path = "../ingot-config" }
+ingot-connectivity = { path = "../ingot-connectivity" }
+ingot-core = { path = "../ingot-core" }
+ingot-engine = { path = "../ingot-engine" }
+ingot-ipc = { path = "../ingot-ipc" }
+ingot-primitives = { path = "../ingot-primitives" }
+rust_decimal.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+iceoryx2.workspace = true
+ingot-connectivity = { path = "../ingot-connectivity" }
+ingot-core = { path = "../ingot-core" }
+ingot-engine = { path = "../ingot-engine" }
+ingot-ipc = { path = "../ingot-ipc" }
+ingot-primitives = { path = "../ingot-primitives" }
+rust_decimal.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

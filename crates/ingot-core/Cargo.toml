@@ -1,0 +1,30 @@
+[package]
+name = "ingot-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+ingot-primitives = { version = "0.1.0", path = "../ingot-primitives" }
+rust_decimal.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+assert_matches.workspace = true
+criterion.workspace = true
+proptest.workspace = true
+serde_json.workspace = true
+
+[[bench]]
+name = "hot_path"
+harness = false
+
+[lints]
+workspace = true
