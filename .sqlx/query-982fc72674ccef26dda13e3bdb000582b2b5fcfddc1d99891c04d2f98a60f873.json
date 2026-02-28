@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO accounts (id, name, account_type, currency_code, decimals)\n        VALUES ($1, $2, $3, $4, $5)\n        ON CONFLICT (id) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int2"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "982fc72674ccef26dda13e3bdb000582b2b5fcfddc1d99891c04d2f98a60f873"
+}

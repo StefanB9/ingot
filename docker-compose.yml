@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:18.3
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ingot
+      POSTGRES_USER: ingot_app
+      POSTGRES_PASSWORD: ingot_dev
+    volumes:
+      - pgdata:/var/lib/postgresql
+
+  questdb:
+    image: questdb/questdb:9.3.3
+    ports:
+      - "9009:9009"
+      - "8812:8812"
+      - "9000:9000"
+    volumes:
+      - questdata:/var/lib/questdb
+
+volumes:
+  pgdata:
+  questdata:
