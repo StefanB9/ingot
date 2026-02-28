@@ -179,7 +179,15 @@ Minimum necessary. `pub(super)` or `pub(crate)` for internal types. Private fiel
 
 ### Dependencies
 
-- `default-features = false` with explicit feature selection.
+**Rule 1: Zero Duplicate Versions.** Never define a dependency version in a member crate. All versions must be strictly centralized in `[workspace.dependencies]` at the root. Member crates use `dep = { workspace = true }`. This guarantees a single source of truth, prevents version mismatches across the workspace, and avoids duplicate compilations of the same crate.
+
+**Rule 2: Always Disable Default Features.** By default, always explicitly set `default-features = false` when declaring dependencies in `[workspace.dependencies]`. Do not rely on the author's default feature set, as it often includes unwanted bloat, extra dependencies, or unnecessary I/O/network capabilities.
+
+**Rule 3: Granular Feature Flags.** In `[workspace.dependencies]`, only define the base shared features that *every* member crate requires. If a specific member crate needs an additional feature, it must append it locally in its own `Cargo.toml` (e.g., `tokio = { workspace = true, features = ["fs"] }`).
+
+**Rule 4: Minimum Features Enabled.** Strictly limit feature opt-ins to the absolute bare minimum required for the code to compile and run. Never use blanket features like `features = ["full"]`. This keeps compile times fast, binary sizes small, and the attack surface minimal.
+
+**General:**
 - New dependencies require justification: what problem, why this crate, what alternatives were considered.
 - Prefer zero-cost abstractions over convenience crates.
 
