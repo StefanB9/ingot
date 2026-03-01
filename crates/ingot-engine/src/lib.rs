@@ -4,6 +4,7 @@ pub mod strategy;
 use std::sync::Arc;
 
 use anyhow::Result;
+use chrono::Utc;
 
 /// Capacity of the market-data channel between the exchange adapter and the
 /// engine. At Kraken WebSocket rates (~1–5 ticks/s per pair) this provides
@@ -245,6 +246,39 @@ impl<E: Exchange> TradingEngine<E> {
         order: &OrderRequest,
         ack_tx: Option<oneshot::Sender<OrderAcknowledgment>>,
     ) {
+        // Reject market orders when no price data is available for the symbol.
+        // Limit orders carry an explicit price and bypass this check.
+        if order.price.is_none() {
+            let Some((base_code, quote_code)) = order.symbol.parts() else {
+                warn!(symbol = %order.symbol, "rejecting order: invalid symbol format");
+                if let Some(tx) = ack_tx {
+                    let _ = tx.send(OrderAcknowledgment {
+                        exchange_id: String::new(),
+                        client_id: None,
+                        timestamp: Utc::now(),
+                        status: OrderStatus::Rejected,
+                    });
+                }
+                return;
+            };
+            let base = Currency::from_code(base_code);
+            let quote = Currency::from_code(quote_code);
+            let one_base = Money::new(Amount::from(dec!(1)), base);
+            let board = self.market_data.read().await;
+            if board.convert(&one_base, &quote).is_err() {
+                warn!(symbol = %order.symbol, "rejecting market order: no price data");
+                if let Some(tx) = ack_tx {
+                    let _ = tx.send(OrderAcknowledgment {
+                        exchange_id: String::new(),
+                        client_id: None,
+                        timestamp: Utc::now(),
+                        status: OrderStatus::Rejected,
+                    });
+                }
+                return;
+            }
+        }
+
         info!("Placing order");
 
         match self.exchange.place_order(order).await {
