@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
-use ingot_core::accounting::Account;
+use ingot_core::accounting::{Account, Transaction};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tracing::instrument;
 
-use crate::{config::StorageConfig, postgres::accounts};
+use crate::{
+    config::StorageConfig,
+    postgres::{accounts, transactions},
+};
 
 /// Unified storage facade. Holds connection pools for `PostgreSQL` and
 /// `QuestDB`.
@@ -39,6 +42,16 @@ impl StorageService {
     /// Load all accounts, ordered by `created_at`.
     pub async fn load_accounts(&self) -> Result<Vec<Account>> {
         accounts::load_accounts(&self.pg).await
+    }
+
+    /// Persist a transaction and its entries atomically.
+    pub async fn save_transaction(&self, tx: &Transaction) -> Result<()> {
+        transactions::save_transaction(&self.pg, tx).await
+    }
+
+    /// Load all transactions with entries, ordered by `posted_at`.
+    pub async fn load_transactions(&self) -> Result<Vec<Transaction>> {
+        transactions::load_transactions(&self.pg).await
     }
 
     /// Expose the underlying pool for direct query access.
