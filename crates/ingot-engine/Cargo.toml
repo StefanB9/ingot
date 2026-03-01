@@ -9,6 +9,7 @@ anyhow.workspace = true
 ingot-connectivity = { version = "0.1.0", path = "../ingot-connectivity" }
 ingot-core = { version = "0.1.0", path = "../ingot-core" }
 ingot-primitives = { version = "0.1.0", path = "../ingot-primitives" }
+ingot-storage = { version = "0.1.0", path = "../ingot-storage" }
 rust_decimal.workspace = true
 smallvec.workspace = true
 tokio.workspace = true

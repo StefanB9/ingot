@@ -155,6 +155,16 @@ impl Ledger {
         self.transactions.len()
     }
 
+    /// Iterate over all accounts in the ledger.
+    pub fn accounts(&self) -> impl Iterator<Item = &Account> {
+        self.accounts.values()
+    }
+
+    /// Slice of all posted transactions, in posting order.
+    pub fn transactions(&self) -> &[Transaction] {
+        &self.transactions
+    }
+
     /// Returns `true` if the ledger contains an account with the given type
     /// and currency.
     pub fn has_account(&self, account_type: AccountType, currency: Currency) -> bool {
@@ -195,7 +205,7 @@ impl Ledger {
         quote: Currency,
         base_qty: Amount,
         fill_price: Price,
-    ) -> Result<(), AccountingError> {
+    ) -> Result<Transaction, AccountingError> {
         let quote_amount = base_qty * fill_price;
 
         let base_asset = self.find_account(AccountType::Asset, base)?;
@@ -224,9 +234,10 @@ impl Ledger {
             }
         }
 
+        let saved = tx.clone();
         let vtx = self.prepare_transaction(tx)?;
         self.post_transaction(vtx);
-        Ok(())
+        Ok(saved)
     }
 }
 
@@ -475,6 +486,79 @@ mod tests {
             Amount::from(dec!(50000))
         );
         assert_eq!(ledger.get_balance(btc_asset.id)?.amount, Amount::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn test_accounts_empty() {
+        let ledger = Ledger::new();
+        assert_eq!(ledger.accounts().count(), 0);
+    }
+
+    #[test]
+    fn test_accounts_returns_added() {
+        let (mut ledger, usd, _) = setup_ledger();
+        let a1 = make_account("Cash", AccountType::Asset, usd);
+        let a2 = make_account("Equity", AccountType::Equity, usd);
+        ledger.add_account(a1.clone());
+        ledger.add_account(a2.clone());
+
+        let ids: Vec<Uuid> = ledger.accounts().map(|a| a.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&a1.id));
+        assert!(ids.contains(&a2.id));
+    }
+
+    #[test]
+    fn test_transactions_empty() {
+        let ledger = Ledger::new();
+        assert!(ledger.transactions().is_empty());
+    }
+
+    #[test]
+    fn test_transactions_returns_posted() -> Result<()> {
+        let (mut ledger, usd, _) = setup_ledger();
+        let wallet = make_account("Wallet", AccountType::Asset, usd);
+        let equity = make_account("Equity", AccountType::Equity, usd);
+        ledger.add_account(wallet.clone());
+        ledger.add_account(equity.clone());
+
+        let mut tx = Transaction::new("Deposit".into());
+        tx.add_entry(&wallet, Amount::from(dec!(100)), AccountSide::Debit)?;
+        tx.add_entry(&equity, Amount::from(dec!(100)), AccountSide::Credit)?;
+        let tx_id = tx.id;
+        let vtx = ledger.prepare_transaction(tx)?;
+        ledger.post_transaction(vtx);
+
+        let txns = ledger.transactions();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(txns[0].id, tx_id);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_post_order_fill_returns_transaction() -> Result<()> {
+        let (mut ledger, usd_asset, usd_equity, _btc_asset, _btc_equity) = make_spot_ledger();
+
+        let mut seed = Transaction::new("Seed USD".into());
+        seed.add_entry(&usd_asset, Amount::from(dec!(50000)), AccountSide::Debit)?;
+        seed.add_entry(&usd_equity, Amount::from(dec!(50000)), AccountSide::Credit)?;
+        let vseed = ledger.prepare_transaction(seed)?;
+        ledger.post_transaction(vseed);
+
+        let fill_tx = ledger.post_order_fill(
+            OrderSide::Buy,
+            Currency::btc(),
+            Currency::usd(),
+            Amount::from(dec!(1)),
+            Price::from(dec!(50000)),
+        )?;
+
+        // The returned transaction should have 4 entries (spot trade)
+        assert_eq!(fill_tx.entries.len(), 4);
+        assert!(fill_tx.description.contains("buy"));
+
         Ok(())
     }
 

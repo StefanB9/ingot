@@ -28,6 +28,7 @@ use ingot_core::{
     feed::Ticker,
 };
 use ingot_primitives::{Amount, Currency, Money, OrderStatus, Price, Symbol};
+use ingot_storage::event::StorageEvent;
 use rust_decimal::{Decimal, dec};
 use smallvec::SmallVec;
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
@@ -65,6 +66,7 @@ pub struct TradingEngine<E: Exchange> {
     exchange: E,
     strategies: Vec<Box<dyn Strategy>>,
     event_tx: Option<broadcast::Sender<WsMessage>>,
+    storage_tx: Option<mpsc::Sender<StorageEvent>>,
 }
 
 impl<E: Exchange> TradingEngine<E> {
@@ -80,6 +82,7 @@ impl<E: Exchange> TradingEngine<E> {
             exchange,
             strategies,
             event_tx: None,
+            storage_tx: None,
         }
     }
 
@@ -91,6 +94,11 @@ impl<E: Exchange> TradingEngine<E> {
         let (tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         self.event_tx = Some(tx.clone());
         tx
+    }
+
+    /// Attach a storage event channel for persistence.
+    pub fn with_storage(&mut self, storage_tx: mpsc::Sender<StorageEvent>) {
+        self.storage_tx = Some(storage_tx);
     }
 
     /// The main event loop.
@@ -164,23 +172,30 @@ impl<E: Exchange> TradingEngine<E> {
         let base = Currency::from_code(base_code);
         let quote = Currency::from_code(quote_code);
 
-        let mut ledger = self.ledger.write().await;
-        for (currency, label) in [(base, base_code.as_str()), (quote, quote_code.as_str())] {
-            if !ledger.has_account(AccountType::Asset, currency) {
-                ledger.add_account(Account::new(
-                    format!("{label} (Kraken)"),
-                    AccountType::Asset,
-                    currency,
-                ));
-                info!(currency = label, "provisioned asset account");
+        let mut created: SmallVec<Account, 4> = SmallVec::new();
+        {
+            let mut ledger = self.ledger.write().await;
+            for (currency, label) in [(base, base_code.as_str()), (quote, quote_code.as_str())] {
+                if !ledger.has_account(AccountType::Asset, currency) {
+                    let account =
+                        Account::new(format!("{label} (Kraken)"), AccountType::Asset, currency);
+                    ledger.add_account(account.clone());
+                    created.push(account);
+                    info!(currency = label, "provisioned asset account");
+                }
+                if !ledger.has_account(AccountType::Equity, currency) {
+                    let account =
+                        Account::new(format!("{label} Capital"), AccountType::Equity, currency);
+                    ledger.add_account(account.clone());
+                    created.push(account);
+                    info!(currency = label, "provisioned equity account");
+                }
             }
-            if !ledger.has_account(AccountType::Equity, currency) {
-                ledger.add_account(Account::new(
-                    format!("{label} Capital"),
-                    AccountType::Equity,
-                    currency,
-                ));
-                info!(currency = label, "provisioned equity account");
+        } // write lock released
+
+        if let Some(ref storage_tx) = self.storage_tx {
+            for account in created {
+                let _ = storage_tx.try_send(StorageEvent::AccountCreated { account });
             }
         }
     }
@@ -209,6 +224,11 @@ impl<E: Exchange> TradingEngine<E> {
             let _ = tx.send(update);
         }
 
+        // Best-effort storage — drop ticks if channel is full
+        if let Some(ref storage_tx) = self.storage_tx {
+            let _ = storage_tx.try_send(StorageEvent::Tick { ticker: tick });
+        }
+
         for order in orders {
             self.handle_order_request(&order, None).await;
         }
@@ -232,6 +252,13 @@ impl<E: Exchange> TradingEngine<E> {
                 info!(exchange_id = %ack.exchange_id, "Order Acknowledged");
                 if ack.status == OrderStatus::Filled {
                     self.record_fill(order).await;
+                }
+                // Best-effort storage of order placement
+                if let Some(ref storage_tx) = self.storage_tx {
+                    let _ = storage_tx.try_send(StorageEvent::OrderPlaced {
+                        request: *order,
+                        acknowledgment: ack.clone(),
+                    });
                 }
                 // Send ack to the requester if they provided a oneshot channel
                 if let Some(tx) = ack_tx {
@@ -281,9 +308,24 @@ impl<E: Exchange> TradingEngine<E> {
         };
 
         let base_qty = Amount::from(order.quantity);
-        let mut ledger = self.ledger.write().await;
-        if let Err(e) = ledger.post_order_fill(order.side, base, quote, base_qty, fill_price) {
-            error!(error = %e, "failed to record fill in ledger");
+        let fill_result = {
+            let mut ledger = self.ledger.write().await;
+            ledger.post_order_fill(order.side, base, quote, base_qty, fill_price)
+        }; // write lock released
+
+        match fill_result {
+            Ok(transaction) => {
+                if let Some(ref storage_tx) = self.storage_tx
+                    && let Err(e) = storage_tx
+                        .send(StorageEvent::TransactionPosted { transaction })
+                        .await
+                {
+                    error!(error = %e, "storage channel closed");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "failed to record fill in ledger");
+            }
         }
     }
 }
