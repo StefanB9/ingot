@@ -42,7 +42,10 @@ pub enum ReplCommand {
         /// Trading pair symbol (e.g., ETH-USD, SOL-USD)
         symbol: Symbol,
     },
+    /// Exit the CLI (server keeps running).
     #[command(name = "quit", visible_alias = "exit")]
     Quit,
+    /// Shut down the remote ingot-server.
+    Shutdown,
     Help,
 }
