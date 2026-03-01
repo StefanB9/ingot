@@ -122,13 +122,11 @@ fn main() -> Result<()> {
                 }
             }
             Err(ReadlineError::Interrupted) => {
-                writeln!(stdout, "(Ctrl-C)")?;
-                let _ = send_command(&client, IpcCommand::Shutdown);
+                writeln!(stdout, "(Ctrl-C) Exiting CLI. Server keeps running.")?;
                 break;
             }
             Err(ReadlineError::Eof) => {
-                writeln!(stdout, "(Ctrl-D)")?;
-                let _ = send_command(&client, IpcCommand::Shutdown);
+                writeln!(stdout, "(Ctrl-D) Exiting CLI. Server keeps running.")?;
                 break;
             }
             Err(err) => {
@@ -157,7 +155,11 @@ fn handle_command(cli: &ReplCli, client: &IpcClient, stdout: &mut std::io::Stdou
             }
         }
         ReplCommand::Quit => {
-            writeln!(stdout, "[*] Shutting down...")?;
+            writeln!(stdout, "[*] Exiting CLI. Server keeps running.")?;
+            return Ok(true);
+        }
+        ReplCommand::Shutdown => {
+            writeln!(stdout, "[*] Shutting down server...")?;
             match send_command(client, IpcCommand::Shutdown) {
                 Ok(IpcCommandResponse::ShutdownAck { success: true }) => {
                     writeln!(stdout, "[*] Server acknowledged shutdown")?;
@@ -288,7 +290,11 @@ fn print_help(stdout: &mut std::io::Stdout) -> Result<()> {
     )?;
     writeln!(
         stdout,
-        "  quit | exit            Shut down the server and exit"
+        "  quit | exit            Exit the CLI (server keeps running)"
+    )?;
+    writeln!(
+        stdout,
+        "  shutdown               Shut down the remote ingot-server"
     )?;
     writeln!(stdout, "  help                   Show this help message")?;
     Ok(())

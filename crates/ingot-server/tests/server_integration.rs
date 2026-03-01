@@ -908,3 +908,29 @@ fn test_unsubscribed_symbol_has_no_ticks() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_server_accepts_new_client_after_disconnect() -> Result<()> {
+    let harness = TestHarness::setup()?;
+
+    // Client A: send heartbeat and verify response
+    {
+        let resp = harness.send_command(IpcCommand::Heartbeat)?;
+        assert!(
+            matches!(resp, IpcCommandResponse::Heartbeat { .. }),
+            "client A: expected Heartbeat, got {resp:?}"
+        );
+    } // client A dropped here — simulates disconnect
+
+    // Brief pause for iceoryx2 cleanup
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Client B: send heartbeat — must succeed after A disconnected
+    let resp = harness.send_command(IpcCommand::Heartbeat)?;
+    assert!(
+        matches!(resp, IpcCommandResponse::Heartbeat { .. }),
+        "client B: expected Heartbeat after A disconnect, got {resp:?}"
+    );
+
+    Ok(())
+}

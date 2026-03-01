@@ -61,7 +61,7 @@ fn run(
         .request_response::<IpcCommand, IpcCommandResponse>()
         .open_or_create()?;
 
-    let server = service.server_builder().create()?;
+    let mut server = service.server_builder().create()?;
 
     info!("IPC command thread started");
 
@@ -91,8 +91,24 @@ fn run(
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(e) => {
-                error!(error = %e, "IPC server receive error");
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                warn!(error = %e, "IPC server receive error, recreating port");
+                drop(server);
+                loop {
+                    match service.server_builder().create() {
+                        Ok(new_server) => {
+                            server = new_server;
+                            info!("IPC server port recreated");
+                            break;
+                        }
+                        Err(recreate_err) => {
+                            error!(error = %recreate_err, "failed to recreate server port");
+                            if shutdown.load(Ordering::Relaxed) {
+                                return Ok(());
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+                    }
+                }
             }
         }
     }
