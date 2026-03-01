@@ -4,12 +4,12 @@ use anyhow::Result;
 use ingot_connectivity::PaperExchange;
 use ingot_core::{accounting::QuoteBoard, execution::OrderRequest, feed::Ticker};
 use ingot_engine::{
-    MARKET_DATA_CHANNEL_CAPACITY, TradingEngine, bootstrap_ledger,
+    EngineCommand, MARKET_DATA_CHANNEL_CAPACITY, TradingEngine, bootstrap_ledger,
     strategy::{QuoteBoardStrategy, Strategy, StrategyContext},
 };
-use ingot_primitives::{Amount, Currency, Money, OrderSide, Quantity, Symbol};
+use ingot_primitives::{Amount, Currency, Money, OrderSide, OrderStatus, Price, Quantity, Symbol};
 use rust_decimal::dec;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, oneshot};
 
 /// A mock strategy that records whether `on_tick` was called.
 struct RecordingStrategy;
@@ -184,6 +184,98 @@ async fn test_engine_quote_board_strategy_integration() -> Result<()> {
     let one_btc = Money::new(Amount::from(dec!(1)), btc);
     let result = board.convert(&one_btc, &usd)?;
     assert_eq!(result.amount, Amount::from(dec!(50000)));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_engine_rejects_market_order_without_price_data() -> Result<()> {
+    let ledger = bootstrap_ledger().await?;
+    let market_data = Arc::new(RwLock::new(QuoteBoard::new()));
+    let (market_tx, market_rx) = mpsc::channel(MARKET_DATA_CHANNEL_CAPACITY);
+    let (cmd_tx, cmd_rx) = mpsc::channel(32);
+
+    let (paper_tx, _paper_rx) = mpsc::channel(64);
+    let exchange = PaperExchange::new().connect(paper_tx).await?;
+
+    let strategies: Vec<Box<dyn Strategy>> = vec![Box::new(QuoteBoardStrategy)];
+    let mut engine = TradingEngine::new(ledger.clone(), market_data, exchange, strategies);
+
+    let engine_handle = tokio::spawn(async move { engine.run(market_rx, cmd_rx).await });
+
+    // Send a market order for an unsubscribed symbol (no price data in QuoteBoard)
+    let order = OrderRequest::new_market(
+        Symbol::new("ETH-USD"),
+        OrderSide::Buy,
+        Quantity::from(dec!(1)),
+    );
+    let (ack_tx, ack_rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::PlaceOrder(order, Some(ack_tx)))
+        .await?;
+
+    let ack = tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await??;
+    assert_eq!(
+        ack.status,
+        OrderStatus::Rejected,
+        "market order without price data should be rejected, got {:?}",
+        ack.status
+    );
+
+    // Verify ledger unchanged — no new transactions beyond the seed
+    let l = ledger.read().await;
+    assert_eq!(
+        l.transactions().len(),
+        1,
+        "ledger should only have the seed transaction"
+    );
+
+    drop(cmd_tx);
+    drop(market_tx);
+    engine_handle.await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_engine_accepts_limit_order_without_subscription() -> Result<()> {
+    let ledger = bootstrap_ledger().await?;
+    let market_data = Arc::new(RwLock::new(QuoteBoard::new()));
+    let (market_tx, market_rx) = mpsc::channel(MARKET_DATA_CHANNEL_CAPACITY);
+    let (cmd_tx, cmd_rx) = mpsc::channel(32);
+
+    let (paper_tx, _paper_rx) = mpsc::channel(64);
+    let exchange = PaperExchange::new().connect(paper_tx).await?;
+
+    let strategies: Vec<Box<dyn Strategy>> = vec![Box::new(QuoteBoardStrategy)];
+    let mut engine = TradingEngine::new(ledger.clone(), market_data, exchange, strategies);
+
+    let engine_handle = tokio::spawn(async move { engine.run(market_rx, cmd_rx).await });
+
+    // Send a limit order with explicit price — should work even without
+    // subscription
+    let order = OrderRequest::new_limit(
+        Symbol::new("ETH-USD"),
+        OrderSide::Buy,
+        Quantity::from(dec!(1)),
+        Price::from(dec!(3000)),
+    );
+    let (ack_tx, ack_rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::PlaceOrder(order, Some(ack_tx)))
+        .await?;
+
+    let ack = tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await??;
+    assert_eq!(
+        ack.status,
+        OrderStatus::Filled,
+        "limit order with explicit price should be filled, got {:?}",
+        ack.status
+    );
+
+    drop(cmd_tx);
+    drop(market_tx);
+    engine_handle.await??;
 
     Ok(())
 }
