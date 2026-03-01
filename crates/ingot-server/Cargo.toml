@@ -13,6 +13,7 @@ ingot-core = { path = "../ingot-core" }
 ingot-engine = { path = "../ingot-engine" }
 ingot-ipc = { path = "../ingot-ipc" }
 ingot-primitives = { path = "../ingot-primitives" }
+ingot-storage = { path = "../ingot-storage" }
 rust_decimal.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -150,6 +150,11 @@ impl Ledger {
         Ok(Money::new(total_equity, *denomination))
     }
 
+    /// Number of posted transactions.
+    pub fn transaction_count(&self) -> usize {
+        self.transactions.len()
+    }
+
     /// Returns `true` if the ledger contains an account with the given type
     /// and currency.
     pub fn has_account(&self, account_type: AccountType, currency: Currency) -> bool {
@@ -470,6 +475,37 @@ mod tests {
             Amount::from(dec!(50000))
         );
         assert_eq!(ledger.get_balance(btc_asset.id)?.amount, Amount::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn test_transaction_count_empty() {
+        let ledger = Ledger::new();
+        assert_eq!(ledger.transaction_count(), 0);
+    }
+
+    #[test]
+    fn test_transaction_count_after_posts() -> Result<()> {
+        let (mut ledger, usd, _) = setup_ledger();
+        let wallet = make_account("Wallet", AccountType::Asset, usd);
+        let equity = make_account("Equity", AccountType::Equity, usd);
+        ledger.add_account(wallet.clone());
+        ledger.add_account(equity.clone());
+
+        let mut tx1 = Transaction::new("Deposit 1".into());
+        tx1.add_entry(&wallet, Amount::from(dec!(100)), AccountSide::Debit)?;
+        tx1.add_entry(&equity, Amount::from(dec!(100)), AccountSide::Credit)?;
+        let vtx1 = ledger.prepare_transaction(tx1)?;
+        ledger.post_transaction(vtx1);
+        assert_eq!(ledger.transaction_count(), 1);
+
+        let mut tx2 = Transaction::new("Deposit 2".into());
+        tx2.add_entry(&wallet, Amount::from(dec!(50)), AccountSide::Debit)?;
+        tx2.add_entry(&equity, Amount::from(dec!(50)), AccountSide::Credit)?;
+        let vtx2 = ledger.prepare_transaction(tx2)?;
+        ledger.post_transaction(vtx2);
+        assert_eq!(ledger.transaction_count(), 2);
+
         Ok(())
     }
 
