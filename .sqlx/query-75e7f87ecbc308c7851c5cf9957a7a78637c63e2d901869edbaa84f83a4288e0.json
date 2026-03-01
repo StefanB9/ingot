@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT transaction_id, account_id, side, amount, currency_code, decimals\n        FROM entries\n        ORDER BY transaction_id, id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "transaction_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "account_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "side",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "amount",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "currency_code",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "decimals",
+        "type_info": "Int2"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "75e7f87ecbc308c7851c5cf9957a7a78637c63e2d901869edbaa84f83a4288e0"
+}

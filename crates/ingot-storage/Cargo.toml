@@ -12,6 +12,7 @@ ingot-primitives = { version = "0.1.0", path = "../ingot-primitives" }
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+smallvec.workspace = true
 sqlx.workspace = true
 tracing.workspace = true
 uuid.workspace = true
