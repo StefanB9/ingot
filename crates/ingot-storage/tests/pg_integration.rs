@@ -3,7 +3,12 @@ use ingot_core::accounting::{
     Account, AccountSide, AccountType, ExchangeRate, Ledger, QuoteBoard, Transaction,
 };
 use ingot_primitives::{Amount, Currency, OrderSide, Price};
-use ingot_storage::{config::StorageConfig, service::StorageService};
+use ingot_storage::{
+    config::StorageConfig,
+    event::{STORAGE_CHANNEL_CAPACITY, StorageEvent},
+    service::StorageService,
+    task::run_storage_task,
+};
 use rust_decimal::{Decimal, dec};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -585,5 +590,167 @@ async fn test_recover_ledger_multiple_transactions_replayed_in_order() -> Result
         recovered.get_balance(equity.id)?.amount,
         Amount::from(dec!(6000))
     );
+    Ok(())
+}
+
+// --- Storage task integration tests ---
+
+#[tokio::test]
+async fn test_storage_task_processes_account_created() -> Result<()> {
+    let (service, _container) = test_storage_service().await?;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(STORAGE_CHANNEL_CAPACITY);
+
+    let account = Account::new("Cash".into(), AccountType::Asset, Currency::usd());
+    tx.send(StorageEvent::AccountCreated {
+        account: account.clone(),
+    })
+    .await
+    .context("send failed")?;
+    drop(tx); // close channel → task exits after final flush
+
+    let task_service = service.clone();
+    run_storage_task(task_service, rx, 50, 100).await?;
+
+    let loaded = service.load_accounts().await?;
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].id, account.id);
+    assert_eq!(loaded[0].name, "Cash");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_storage_task_processes_transaction_posted() -> Result<()> {
+    let (service, _container) = test_storage_service().await?;
+
+    let cash = Account::new("Cash".into(), AccountType::Asset, Currency::usd());
+    let equity = Account::new("Equity".into(), AccountType::Equity, Currency::usd());
+
+    // Pre-save accounts so FK constraints are satisfied
+    service.save_account(&cash).await?;
+    service.save_account(&equity).await?;
+
+    let tx_data = balanced_transaction("Deposit", &cash, &equity, Amount::from(dec!(500)))?;
+    let tx_id = tx_data.id;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(STORAGE_CHANNEL_CAPACITY);
+
+    tx.send(StorageEvent::TransactionPosted {
+        transaction: tx_data,
+    })
+    .await
+    .context("send failed")?;
+    drop(tx);
+
+    let task_service = service.clone();
+    run_storage_task(task_service, rx, 50, 100).await?;
+
+    let loaded = service.load_transactions().await?;
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].id, tx_id);
+    assert_eq!(loaded[0].entries.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_storage_task_flushes_on_batch_size() -> Result<()> {
+    let (service, _container) = test_storage_service().await?;
+
+    // Use batch_size=2 so we can trigger a flush with just 2 events
+    let (tx, rx) = tokio::sync::mpsc::channel(STORAGE_CHANNEL_CAPACITY);
+
+    let a1 = Account::new("Cash".into(), AccountType::Asset, Currency::usd());
+    let a2 = Account::new("BTC".into(), AccountType::Asset, Currency::btc());
+
+    tx.send(StorageEvent::AccountCreated {
+        account: a1.clone(),
+    })
+    .await
+    .context("send a1 failed")?;
+    tx.send(StorageEvent::AccountCreated {
+        account: a2.clone(),
+    })
+    .await
+    .context("send a2 failed")?;
+
+    // Send a Flush to verify the batch was already flushed at batch_size=2,
+    // then close channel
+    let (flush_tx, flush_rx) = tokio::sync::oneshot::channel();
+    tx.send(StorageEvent::Flush { done: flush_tx })
+        .await
+        .context("send flush failed")?;
+    drop(tx);
+
+    let task_service = service.clone();
+    let task_handle =
+        tokio::spawn(async move { run_storage_task(task_service, rx, 2, 60_000).await });
+
+    // Wait for flush to complete
+    flush_rx.await.context("flush oneshot dropped")?;
+
+    // Verify accounts are already in DB (flushed at batch_size boundary)
+    let loaded = service.load_accounts().await?;
+    assert_eq!(loaded.len(), 2);
+
+    task_handle.await.context("task panicked")??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_storage_task_flushes_on_channel_close() -> Result<()> {
+    let (service, _container) = test_storage_service().await?;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(STORAGE_CHANNEL_CAPACITY);
+
+    let account = Account::new("Cash".into(), AccountType::Asset, Currency::usd());
+    tx.send(StorageEvent::AccountCreated {
+        account: account.clone(),
+    })
+    .await
+    .context("send failed")?;
+    // Drop sender with buffer not full (batch_size=50) — task should final-flush
+    drop(tx);
+
+    let task_service = service.clone();
+    run_storage_task(task_service, rx, 50, 60_000).await?;
+
+    let loaded = service.load_accounts().await?;
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].id, account.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_storage_task_flush_command_drains_buffer() -> Result<()> {
+    let (service, _container) = test_storage_service().await?;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(STORAGE_CHANNEL_CAPACITY);
+
+    let account = Account::new("Cash".into(), AccountType::Asset, Currency::usd());
+    tx.send(StorageEvent::AccountCreated {
+        account: account.clone(),
+    })
+    .await
+    .context("send failed")?;
+
+    // Send flush command (buffer has 1 item, batch_size=50 — not yet flushed)
+    let (flush_tx, flush_rx) = tokio::sync::oneshot::channel();
+    tx.send(StorageEvent::Flush { done: flush_tx })
+        .await
+        .context("send flush failed")?;
+    drop(tx);
+
+    let task_service = service.clone();
+    let task_handle =
+        tokio::spawn(async move { run_storage_task(task_service, rx, 50, 60_000).await });
+
+    // Wait for flush acknowledgment
+    flush_rx.await.context("flush oneshot dropped")?;
+
+    // Verify data is persisted
+    let loaded = service.load_accounts().await?;
+    assert_eq!(loaded.len(), 1);
+
+    task_handle.await.context("task panicked")??;
     Ok(())
 }
