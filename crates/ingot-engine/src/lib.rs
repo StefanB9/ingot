@@ -24,7 +24,7 @@ pub const EVENT_BROADCAST_CAPACITY: usize = 256;
 use ingot_connectivity::Exchange;
 use ingot_core::{
     accounting::{Account, AccountSide, AccountType, Ledger, QuoteBoard, Transaction},
-    api::{TickerUpdate, WsMessage},
+    api::{NavUpdate, TickerUpdate, WsMessage},
     execution::{OrderAcknowledgment, OrderRequest},
     feed::Ticker,
 };
@@ -225,6 +225,8 @@ impl<E: Exchange> TradingEngine<E> {
             let _ = tx.send(update);
         }
 
+        self.broadcast_nav().await;
+
         // Best-effort storage — drop ticks if channel is full
         if let Some(ref storage_tx) = self.storage_tx {
             let _ = storage_tx.try_send(StorageEvent::Tick { ticker: tick });
@@ -356,9 +358,28 @@ impl<E: Exchange> TradingEngine<E> {
                 {
                     error!(error = %e, "storage channel closed");
                 }
+                self.broadcast_nav().await;
             }
             Err(e) => {
                 error!(error = %e, "failed to record fill in ledger");
+            }
+        }
+    }
+
+    /// Compute NAV in USD and broadcast to event subscribers.
+    async fn broadcast_nav(&self) {
+        let Some(ref tx) = self.event_tx else { return };
+        let ledger = self.ledger.read().await;
+        let board = self.market_data.read().await;
+        match ledger.net_asset_value(&board, &Currency::usd()) {
+            Ok(nav) => {
+                let _ = tx.send(WsMessage::Nav(NavUpdate {
+                    amount: nav.amount,
+                    currency: nav.currency,
+                }));
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to compute NAV for broadcast");
             }
         }
     }

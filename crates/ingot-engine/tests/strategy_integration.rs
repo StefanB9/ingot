@@ -2,7 +2,12 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use ingot_connectivity::PaperExchange;
-use ingot_core::{accounting::QuoteBoard, execution::OrderRequest, feed::Ticker};
+use ingot_core::{
+    accounting::QuoteBoard,
+    api::{NavUpdate, WsMessage},
+    execution::OrderRequest,
+    feed::Ticker,
+};
 use ingot_engine::{
     EngineCommand, MARKET_DATA_CHANNEL_CAPACITY, TradingEngine, bootstrap_ledger,
     strategy::{QuoteBoardStrategy, Strategy, StrategyContext},
@@ -232,6 +237,59 @@ async fn test_engine_rejects_market_order_without_price_data() -> Result<()> {
 
     drop(cmd_tx);
     drop(market_tx);
+    engine_handle.await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_engine_broadcasts_nav_on_tick() -> Result<()> {
+    let ledger = bootstrap_ledger().await?;
+    let market_data = Arc::new(RwLock::new(QuoteBoard::new()));
+    let (market_tx, market_rx) = mpsc::channel(MARKET_DATA_CHANNEL_CAPACITY);
+    let (cmd_tx, cmd_rx) = mpsc::channel(32);
+
+    let (paper_tx, _paper_rx) = mpsc::channel(64);
+    let exchange = PaperExchange::new().connect(paper_tx).await?;
+
+    let strategies: Vec<Box<dyn Strategy>> = vec![Box::new(QuoteBoardStrategy)];
+    let mut engine = TradingEngine::new(ledger, market_data, exchange, strategies);
+
+    let event_tx = engine.with_broadcast();
+    let mut event_rx = event_tx.subscribe();
+
+    let engine_handle = tokio::spawn(async move { engine.run(market_rx, cmd_rx).await });
+
+    // Send a tick — should produce both Tick and Nav broadcasts
+    market_tx.send(Ticker::new("BTC-USD", dec!(55000))).await?;
+    drop(market_tx);
+    drop(cmd_tx);
+
+    // Collect broadcast messages
+    let mut got_tick = false;
+    let mut got_nav = false;
+    let deadline = std::time::Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline && (!got_tick || !got_nav) {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), event_rx.recv()).await {
+            Ok(Ok(WsMessage::Tick(_))) => got_tick = true,
+            Ok(Ok(WsMessage::Nav(NavUpdate { amount, .. }))) => {
+                // Seed is 10000 USD, NAV should match
+                assert_eq!(
+                    amount,
+                    Amount::from(dec!(10000)),
+                    "expected NAV of 10000 USD, got {amount:?}"
+                );
+                got_nav = true;
+            }
+            Ok(Ok(_)) => {} // other message types
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    assert!(got_tick, "expected WsMessage::Tick broadcast");
+    assert!(got_nav, "expected WsMessage::Nav broadcast");
+
     engine_handle.await??;
 
     Ok(())
