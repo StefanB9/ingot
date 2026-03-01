@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use ingot_core::accounting::{Account, Transaction};
+use ingot_core::accounting::{Account, Ledger, Transaction};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tracing::instrument;
 
 use crate::{
     config::StorageConfig,
-    postgres::{accounts, transactions},
+    postgres::{accounts, recovery, transactions},
 };
 
 /// Unified storage facade. Holds connection pools for `PostgreSQL` and
@@ -52,6 +52,12 @@ impl StorageService {
     /// Load all transactions with entries, ordered by `posted_at`.
     pub async fn load_transactions(&self) -> Result<Vec<Transaction>> {
         transactions::load_transactions(&self.pg).await
+    }
+
+    /// Rebuild ledger from database. Returns `Err` if DB has no accounts
+    /// (caller should bootstrap a fresh ledger).
+    pub async fn recover_ledger(&self) -> Result<Ledger> {
+        recovery::recover_ledger(&self.pg).await
     }
 
     /// Expose the underlying pool for direct query access.

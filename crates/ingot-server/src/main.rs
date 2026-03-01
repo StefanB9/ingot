@@ -22,6 +22,7 @@ use ingot_engine::{
     strategy::{QuoteBoardStrategy, Strategy},
 };
 use ingot_server::{ipc_command, ipc_publisher};
+use ingot_storage::{config::StorageConfig, service::StorageService};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -48,9 +49,20 @@ async fn main() -> Result<()> {
 
     info!(paper = config.paper, "Starting ingot-server");
 
-    let ledger = bootstrap_ledger()
+    let storage_config = StorageConfig::from_env().context("failed to load storage config")?;
+    let storage = StorageService::connect(&storage_config)
         .await
-        .context("failed to bootstrap ledger")?;
+        .context("failed to connect to storage")?;
+
+    let ledger = if let Ok(ledger) = storage.recover_ledger().await {
+        info!("Ledger recovered from database");
+        Arc::new(RwLock::new(ledger))
+    } else {
+        info!("No persisted state, bootstrapping fresh ledger");
+        bootstrap_ledger()
+            .await
+            .context("failed to bootstrap ledger")?
+    };
 
     let market_data = Arc::new(RwLock::new(QuoteBoard::new()));
 
