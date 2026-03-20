@@ -1,0 +1,34 @@
+[package]
+name = "ingot-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+ingot-core.workspace = true
+ingot-primitives.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol_str.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+ingot-core.workspace = true
+ingot-primitives.workspace = true
+rust_decimal_macros.workspace = true
+serde_json.workspace = true
+smol_str.workspace = true
+sqlx.workspace = true
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+tokio.workspace = true

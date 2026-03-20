@@ -2,7 +2,7 @@ cargo-features = ["panic-immediate-abort"]
 
 [workspace]
 resolver = "3"
-members = ["crates/ingot-primitives"]
+members = ["crates/ingot-core", "crates/ingot-primitives", "crates/ingot-storage"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,21 @@ edition = "2024"
 authors = ["Stefan Bader"]
 
 [workspace.dependencies]
+anyhow = { version = "1.0.102", default-features = false, features = ["std"] }
+chrono = { version = "0.4.44", default-features = false, features = ["serde", "clock"] }
+ingot-core = { version = "0.1.0", path = "crates/ingot-core" }
+ingot-primitives = { version = "0.1.0", path = "crates/ingot-primitives" }
+rust_decimal = { version = "1.40.0", default-features = false, features = ["serde"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
+smol_str = { version = "0.3.6", default-features = false, features = ["serde"] }
+sqlx = { version = "0.9.0-alpha.1", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "rust_decimal", "json", "macros", "derive", "migrate"] }
+thiserror = { version = "2.0.18", default-features = false }
+tokio = { version = "1.50.0", default-features = false, features = ["macros", "rt-multi-thread"]}
+rust_decimal_macros = { version = "1.40.0", default-features = false }
+testcontainers = { version = "0.27.1", default-features = false }
+testcontainers-modules = { version = "0.15.0", default-features = false, features = ["postgres"] }
+tracing = { version = "0.1.44", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
