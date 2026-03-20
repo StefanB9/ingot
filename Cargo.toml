@@ -2,7 +2,7 @@ cargo-features = ["panic-immediate-abort"]
 
 [workspace]
 resolver = "3"
-members = ["crates/ingot-core", "crates/ingot-primitives", "crates/ingot-storage"]
+members = ["crates/ingot-connectivity","crates/ingot-core", "crates/ingot-primitives", "crates/ingot-storage"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,10 +20,18 @@ serde_json = { version = "1.0.149", default-features = false, features = ["std"]
 smol_str = { version = "0.3.6", default-features = false, features = ["serde"] }
 sqlx = { version = "0.9.0-alpha.1", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "rust_decimal", "json", "macros", "derive", "migrate"] }
 thiserror = { version = "2.0.18", default-features = false }
-tokio = { version = "1.50.0", default-features = false, features = ["macros", "rt-multi-thread"]}
+tokio = { version = "1.50.0", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"]}
 rust_decimal_macros = { version = "1.40.0", default-features = false }
 testcontainers = { version = "0.27.1", default-features = false }
 testcontainers-modules = { version = "0.15.0", default-features = false, features = ["postgres"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls", "query"] }
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["rustls-tls-native-roots"] }
+hmac = { version = "0.13.0-rc.6", default-features = false }
+sha2 = { version = "0.11.0-rc.5", default-features = false }
+base64 = { version = "0.22.1", default-features = false, features = ["std"] }
+url = { version = "2.5.8", default-features = false }
+futures-util = { version = "0.3.32", default-features = false, features = ["sink"] }
+wiremock = { version = "0.6.5", default-features = false }
 tracing = { version = "0.1.44", default-features = false }
 
 [workspace.lints.rust]
