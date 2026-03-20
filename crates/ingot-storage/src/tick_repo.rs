@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use ingot_core::Tick;
 use ingot_primitives::{OrderSide, Price, Quantity, Symbol};
 use sqlx::PgPool;
+use tracing::instrument;
 
 pub struct PgTickRepository {
     pool: PgPool,
@@ -13,6 +14,7 @@ impl PgTickRepository {
         Self { pool }
     }
 
+    #[instrument(skip(self, ticks), fields(count = ticks.len()))]
     pub async fn insert_batch(&self, ticks: &[Tick]) -> Result<u64> {
         if ticks.is_empty() {
             return Ok(0);
@@ -59,6 +61,7 @@ impl PgTickRepository {
         Ok(count)
     }
 
+    #[instrument(skip(self))]
     pub async fn get_range(
         &self,
         symbol: &Symbol,

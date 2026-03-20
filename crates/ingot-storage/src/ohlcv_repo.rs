@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use ingot_core::OhlcvBar;
 use ingot_primitives::{Price, Quantity, Symbol};
 use sqlx::PgPool;
+use tracing::instrument;
 
 pub struct PgOhlcvRepository {
     pool: PgPool,
@@ -13,6 +14,7 @@ impl PgOhlcvRepository {
         Self { pool }
     }
 
+    #[instrument(skip(self, bars), fields(count = bars.len()))]
     pub async fn insert_batch(&self, bars: &[OhlcvBar]) -> Result<u64> {
         if bars.is_empty() {
             return Ok(0);
@@ -62,6 +64,7 @@ impl PgOhlcvRepository {
         Ok(count)
     }
 
+    #[instrument(skip(self))]
     pub async fn get_range(
         &self,
         symbol: &Symbol,

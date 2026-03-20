@@ -3,6 +3,7 @@ use ingot_core::{Instrument, InstrumentDetails};
 use ingot_primitives::{AssetClass, Currency, Exchange, Price, Symbol};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
+use tracing::instrument;
 
 pub struct PgInstrumentRepository {
     pool: PgPool,
@@ -13,6 +14,7 @@ impl PgInstrumentRepository {
         Self { pool }
     }
 
+    #[instrument(skip(self, instrument), fields(symbol = %instrument.symbol))]
     pub async fn upsert(&self, instrument: &Instrument) -> Result<()> {
         let details_json = serde_json::to_value(&instrument.details)
             .context("failed to serialize instrument details")?;
@@ -54,6 +56,7 @@ impl PgInstrumentRepository {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(symbol = %symbol))]
     pub async fn get_by_symbol(&self, symbol: &Symbol) -> Result<Option<Instrument>> {
         let sym = symbol.as_str();
         let row = sqlx::query!(
@@ -81,6 +84,7 @@ impl PgInstrumentRepository {
         .transpose()
     }
 
+    #[instrument(skip(self), fields(exchange = %exchange))]
     pub async fn list_by_exchange(&self, exchange: Exchange) -> Result<Vec<Instrument>> {
         let exchange_str = exchange.to_string();
         let rows = sqlx::query!(
@@ -109,6 +113,7 @@ impl PgInstrumentRepository {
             .collect()
     }
 
+    #[instrument(skip(self), fields(asset_class = %asset_class))]
     pub async fn list_by_asset_class(&self, asset_class: AssetClass) -> Result<Vec<Instrument>> {
         let asset_class_str = asset_class.to_string();
         let rows = sqlx::query!(
