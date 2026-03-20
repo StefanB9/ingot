@@ -1,15 +1,17 @@
 [package]
-name = "ingot-primitives"
+name = "ingot-core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 chrono.workspace = true
+ingot-primitives.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 smol_str.workspace = true
-thiserror.workspace = true
 
 [lints]
 workspace = true

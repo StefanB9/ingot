@@ -4,10 +4,3 @@ failure-output = "immediate"
 retries = 0
 slow-timeout = "60s"
 threads-required = 1
-
-[test-groups]
-serial-ipc = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = "package(ingot-ipc) | package(ingot-server)"
-test-group = "serial-ipc"

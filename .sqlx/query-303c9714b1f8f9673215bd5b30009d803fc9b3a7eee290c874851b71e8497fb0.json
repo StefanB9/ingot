@@ -1,0 +1,112 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT symbol, asset_class, exchange, base_currency, quote_currency, tick_size, display_name, details_json FROM instruments WHERE exchange = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "symbol",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "instruments",
+            "name": "symbol"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "asset_class",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "instruments",
+            "name": "asset_class"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "exchange",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "instruments",
+            "name": "exchange"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "base_currency",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "instruments",
+            "name": "base_currency"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "quote_currency",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "instruments",
+            "name": "quote_currency"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "tick_size",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "instruments",
+            "name": "tick_size"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "display_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "instruments",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "details_json",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "instruments",
+            "name": "details_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "303c9714b1f8f9673215bd5b30009d803fc9b3a7eee290c874851b71e8497fb0"
+}

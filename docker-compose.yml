@@ -6,9 +6,9 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_DB: ingot_dev
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      POSTGRES_DB: ingot
+      POSTGRES_USER: ingot_app
+      POSTGRES_PASSWORD: ingot_dev
       TS_TUNE_MEMORY: "2GB"
       TS_TUNE_NUM_CPUS: "4"
     volumes:
