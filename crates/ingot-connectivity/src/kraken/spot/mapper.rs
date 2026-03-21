@@ -7,8 +7,7 @@ use ingot_core::{
     OrderFill, OrderId, OrderRequest, OrderStatus, Tick, TickerSnapshot,
 };
 use ingot_primitives::{
-    Amount, AssetClass, Currency, Exchange, OrderSide, OrderType, Price, Quantity, Symbol,
-    TimeInForce,
+    Amount, AssetClass, Currency, Exchange, OrderSide, Price, Quantity, Symbol, TimeInForce,
 };
 use rust_decimal::Decimal;
 use smol_str::SmolStr;
@@ -17,6 +16,12 @@ use super::models::{
     KrakenAssetPair, KrakenBookLevel, KrakenOhlcTuple, KrakenOpenOrder, KrakenOrderBook,
     KrakenTickerInfo, KrakenTradeHistoryEntry, KrakenTradeTuple, KrakenWsBookLevel,
     KrakenWsExecEntry, KrakenWsTickerEntry, KrakenWsTradeEntry,
+};
+use crate::kraken::common::parse_decimal;
+// Re-export shared helpers so existing callers continue to work
+pub(crate) use crate::kraken::common::{
+    map_kraken_order_type, map_kraken_side, order_side_to_kraken, order_type_to_kraken,
+    time_in_force_to_kraken,
 };
 
 /// Strip Kraken's legacy X/Z prefix from asset codes and convert to Currency.
@@ -253,66 +258,9 @@ pub(crate) fn map_book_level(level: &KrakenBookLevel) -> anyhow::Result<OrderBoo
 }
 
 // ---- Enum conversions for private endpoints ----
-
-/// Convert domain `OrderSide` to Kraken string.
-pub(crate) fn order_side_to_kraken(side: OrderSide) -> &'static str {
-    match side {
-        OrderSide::Buy => "buy",
-        OrderSide::Sell => "sell",
-    }
-}
-
-/// Convert domain `OrderType` to Kraken string.
-pub(crate) fn order_type_to_kraken(ot: OrderType) -> &'static str {
-    match ot {
-        OrderType::Market => "market",
-        OrderType::Limit => "limit",
-        OrderType::StopLoss => "stop-loss",
-        OrderType::StopLossLimit => "stop-loss-limit",
-        OrderType::TakeProfit => "take-profit",
-        OrderType::TakeProfitLimit => "take-profit-limit",
-    }
-}
-
-/// Convert domain `TimeInForce` to Kraken's optional `timeinforce` parameter.
-///
-/// Returns `Ok(None)` for GTC (Kraken default), `Ok(Some(...))` for supported
-/// values, and `Err(...)` for unsupported values like `Day`.
-pub(crate) fn time_in_force_to_kraken(tif: TimeInForce) -> anyhow::Result<Option<&'static str>> {
-    match tif {
-        TimeInForce::GoodTilCancelled => Ok(None),
-        TimeInForce::ImmediateOrCancel => Ok(Some("IOC")),
-        TimeInForce::FillOrKill => Ok(Some("FOK")),
-        TimeInForce::Day => Err(anyhow::anyhow!(
-            "Kraken spot does not support Day time-in-force"
-        )),
-        TimeInForce::GoodTilDate(_) => Err(anyhow::anyhow!(
-            "Kraken spot does not support GoodTilDate time-in-force"
-        )),
-    }
-}
-
-/// Parse Kraken side string to domain `OrderSide`.
-pub(crate) fn map_kraken_side(s: &str) -> anyhow::Result<OrderSide> {
-    match s {
-        "buy" => Ok(OrderSide::Buy),
-        "sell" => Ok(OrderSide::Sell),
-        other => Err(anyhow::anyhow!("unknown Kraken order side: {other}")),
-    }
-}
-
-/// Parse Kraken order type string to domain `OrderType`.
-pub(crate) fn map_kraken_order_type(s: &str) -> anyhow::Result<OrderType> {
-    match s {
-        "market" => Ok(OrderType::Market),
-        "limit" => Ok(OrderType::Limit),
-        "stop-loss" => Ok(OrderType::StopLoss),
-        "stop-loss-limit" => Ok(OrderType::StopLossLimit),
-        "take-profit" => Ok(OrderType::TakeProfit),
-        "take-profit-limit" => Ok(OrderType::TakeProfitLimit),
-        other => Err(anyhow::anyhow!("unknown Kraken order type: {other}")),
-    }
-}
+// Shared helpers (order_side_to_kraken, order_type_to_kraken,
+// time_in_force_to_kraken, map_kraken_side, map_kraken_order_type) are
+// re-exported from crate::kraken::common.
 
 /// Map Kraken order status + executed volume to domain `OrderStatus`.
 pub(crate) fn map_order_status(status: &str, vol_exec: &Decimal) -> anyhow::Result<OrderStatus> {
@@ -572,13 +520,10 @@ pub(crate) fn map_ws_execution(entry: &KrakenWsExecEntry) -> anyhow::Result<Orde
     })
 }
 
-fn parse_decimal(s: &str, field: &str) -> anyhow::Result<Decimal> {
-    Decimal::from_str(s).with_context(|| format!("failed to parse {field}: {s}"))
-}
-
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
+    use ingot_primitives::OrderType;
     use rust_decimal_macros::dec;
 
     use super::*;

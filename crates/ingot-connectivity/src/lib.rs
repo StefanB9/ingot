@@ -8,5 +8,8 @@ pub mod traits;
 pub use backfill::BackfillWorker;
 pub use config::{KrakenFuturesConfig, KrakenSpotConfig, PaperExchangeConfig};
 pub use error::ConnectivityError;
-pub use kraken::spot::{KrakenSpotRestClient, KrakenSpotWs};
+pub use kraken::{
+    futures::{KrakenFuturesRestClient, KrakenFuturesWs},
+    spot::{KrakenSpotRestClient, KrakenSpotWs},
+};
 pub use traits::{AccountProvider, MarketDataProvider, OrderExecutor, StreamProvider};

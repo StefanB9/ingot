@@ -5,6 +5,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256, Sha512};
 
+type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
 
 /// Generate a monotonically increasing nonce from system time (milliseconds
@@ -54,6 +55,67 @@ pub(crate) fn sign_request(
     Ok(BASE64.encode(result))
 }
 
+/// Compute the Kraken Futures HMAC-SHA256 API signature.
+///
+/// Algorithm:
+/// 1. Concatenate: `post_data + nonce + endpoint_path`
+/// 2. `hash = SHA256(concatenated)`
+/// 3. `signature = HMAC-SHA256(key = base64_decode(api_secret), msg = hash)`
+/// 4. Return `base64_encode(signature)`
+pub(crate) fn sign_futures_request(
+    endpoint_path: &str,
+    nonce: &str,
+    post_data: &str,
+    api_secret: &str,
+) -> anyhow::Result<String> {
+    let secret_bytes = BASE64
+        .decode(api_secret)
+        .context("failed to base64-decode API secret")?;
+
+    // SHA-256(post_data + nonce + endpoint_path)
+    let mut sha256 = Sha256::new();
+    sha256.update(post_data.as_bytes());
+    sha256.update(nonce.as_bytes());
+    sha256.update(endpoint_path.as_bytes());
+    let hash = sha256.finalize();
+
+    // HMAC-SHA256(key = decoded secret, msg = hash)
+    let mut mac =
+        HmacSha256::new_from_slice(&secret_bytes).context("invalid HMAC-SHA256 key length")?;
+    mac.update(&hash);
+    let result = mac.finalize().into_bytes();
+
+    Ok(BASE64.encode(result))
+}
+
+/// Sign a Kraken Futures WebSocket challenge using HMAC-SHA512.
+///
+/// Algorithm:
+/// 1. `hash = SHA256(challenge_string)`
+/// 2. `signed = HMAC-SHA512(key = base64_decode(api_secret), msg = hash)`
+/// 3. Return `base64_encode(signed)`
+pub(crate) fn sign_futures_ws_challenge(
+    challenge: &str,
+    api_secret: &str,
+) -> anyhow::Result<String> {
+    let secret_bytes = BASE64
+        .decode(api_secret)
+        .context("failed to base64-decode API secret")?;
+
+    // SHA-256(challenge)
+    let mut sha256 = Sha256::new();
+    sha256.update(challenge.as_bytes());
+    let hash = sha256.finalize();
+
+    // HMAC-SHA512(key = decoded secret, msg = hash)
+    let mut mac =
+        HmacSha512::new_from_slice(&secret_bytes).context("invalid HMAC-SHA512 key length")?;
+    mac.update(&hash);
+    let result = mac.finalize().into_bytes();
+
+    Ok(BASE64.encode(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +153,93 @@ mod tests {
             "nonce=123",
             "!!!not-valid-base64!!!",
         );
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.err().unwrap_or_else(|| unreachable!()));
+        assert!(
+            err_msg.contains("base64"),
+            "error should mention base64: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_sign_futures_request_known_vector() -> anyhow::Result<()> {
+        let api_secret = BASE64.encode(b"supersecretkey1234567890abcdef");
+
+        let endpoint_path = "/derivatives/api/v3/sendorder";
+        let nonce = "1616663594000";
+        let post_data = "orderType=lmt&symbol=PI_XBTUSD&side=buy&size=1&limitPrice=35000";
+
+        let signature = sign_futures_request(endpoint_path, nonce, post_data, &api_secret)?;
+
+        // Verify valid base64 and HMAC-SHA256 produces 32 bytes
+        let decoded = BASE64
+            .decode(&signature)
+            .context("signature is not valid base64")?;
+        assert_eq!(decoded.len(), 32, "HMAC-SHA256 should produce 32 bytes");
+
+        // Verify determinism
+        let signature2 = sign_futures_request(endpoint_path, nonce, post_data, &api_secret)?;
+        assert_eq!(signature, signature2, "signing should be deterministic");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sign_futures_request_invalid_base64_secret() {
+        let result = sign_futures_request(
+            "/derivatives/api/v3/sendorder",
+            "123",
+            "nonce=123",
+            "!!!not-valid-base64!!!",
+        );
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.err().unwrap_or_else(|| unreachable!()));
+        assert!(
+            err_msg.contains("base64"),
+            "error should mention base64: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_sign_futures_request_differs_from_spot() -> anyhow::Result<()> {
+        let api_secret = BASE64.encode(b"supersecretkey1234567890abcdef");
+        let path = "/api/v3/test";
+        let nonce = "1616663594000";
+        let post_data = "nonce=1616663594000";
+
+        let spot_sig = sign_request(path, nonce, post_data, &api_secret)?;
+        let futures_sig = sign_futures_request(path, nonce, post_data, &api_secret)?;
+
+        assert_ne!(
+            spot_sig, futures_sig,
+            "spot and futures signatures must differ for same inputs"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sign_futures_ws_challenge_known_vector() -> anyhow::Result<()> {
+        let api_secret = BASE64.encode(b"supersecretkey1234567890abcdef");
+        let challenge = "some-random-challenge-string";
+
+        let signature = sign_futures_ws_challenge(challenge, &api_secret)?;
+
+        let decoded = BASE64
+            .decode(&signature)
+            .context("signature is not valid base64")?;
+        assert_eq!(decoded.len(), 64, "HMAC-SHA512 should produce 64 bytes");
+
+        // Verify determinism
+        let signature2 = sign_futures_ws_challenge(challenge, &api_secret)?;
+        assert_eq!(signature, signature2, "signing should be deterministic");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sign_futures_ws_challenge_invalid_secret() {
+        let result = sign_futures_ws_challenge("challenge", "!!!not-valid-base64!!!");
         assert!(result.is_err());
         let err_msg = format!("{:#}", result.err().unwrap_or_else(|| unreachable!()));
         assert!(
