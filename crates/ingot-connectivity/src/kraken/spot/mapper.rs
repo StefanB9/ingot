@@ -3,18 +3,20 @@ use std::str::FromStr;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use ingot_core::{
-    Instrument, InstrumentDetails, OhlcvBar, OrderBookLevel, OrderBookSnapshot, Tick,
-    TickerSnapshot,
+    Balance, Instrument, InstrumentDetails, OhlcvBar, OpenOrder, OrderBookLevel, OrderBookSnapshot,
+    OrderFill, OrderId, OrderRequest, OrderStatus, Tick, TickerSnapshot,
 };
 use ingot_primitives::{
-    Amount, AssetClass, Currency, Exchange, OrderSide, Price, Quantity, Symbol,
+    Amount, AssetClass, Currency, Exchange, OrderSide, OrderType, Price, Quantity, Symbol,
+    TimeInForce,
 };
 use rust_decimal::Decimal;
 use smol_str::SmolStr;
 
 use super::models::{
-    KrakenAssetPair, KrakenBookLevel, KrakenOhlcTuple, KrakenOrderBook, KrakenTickerInfo,
-    KrakenTradeTuple,
+    KrakenAssetPair, KrakenBookLevel, KrakenOhlcTuple, KrakenOpenOrder, KrakenOrderBook,
+    KrakenTickerInfo, KrakenTradeHistoryEntry, KrakenTradeTuple, KrakenWsBookLevel,
+    KrakenWsExecEntry, KrakenWsTickerEntry, KrakenWsTradeEntry,
 };
 
 /// Strip Kraken's legacy X/Z prefix from asset codes and convert to Currency.
@@ -250,12 +252,333 @@ pub(crate) fn map_book_level(level: &KrakenBookLevel) -> anyhow::Result<OrderBoo
     })
 }
 
+// ---- Enum conversions for private endpoints ----
+
+/// Convert domain `OrderSide` to Kraken string.
+pub(crate) fn order_side_to_kraken(side: OrderSide) -> &'static str {
+    match side {
+        OrderSide::Buy => "buy",
+        OrderSide::Sell => "sell",
+    }
+}
+
+/// Convert domain `OrderType` to Kraken string.
+pub(crate) fn order_type_to_kraken(ot: OrderType) -> &'static str {
+    match ot {
+        OrderType::Market => "market",
+        OrderType::Limit => "limit",
+        OrderType::StopLoss => "stop-loss",
+        OrderType::StopLossLimit => "stop-loss-limit",
+        OrderType::TakeProfit => "take-profit",
+        OrderType::TakeProfitLimit => "take-profit-limit",
+    }
+}
+
+/// Convert domain `TimeInForce` to Kraken's optional `timeinforce` parameter.
+///
+/// Returns `Ok(None)` for GTC (Kraken default), `Ok(Some(...))` for supported
+/// values, and `Err(...)` for unsupported values like `Day`.
+pub(crate) fn time_in_force_to_kraken(tif: TimeInForce) -> anyhow::Result<Option<&'static str>> {
+    match tif {
+        TimeInForce::GoodTilCancelled => Ok(None),
+        TimeInForce::ImmediateOrCancel => Ok(Some("IOC")),
+        TimeInForce::FillOrKill => Ok(Some("FOK")),
+        TimeInForce::Day => Err(anyhow::anyhow!(
+            "Kraken spot does not support Day time-in-force"
+        )),
+        TimeInForce::GoodTilDate(_) => Err(anyhow::anyhow!(
+            "Kraken spot does not support GoodTilDate time-in-force"
+        )),
+    }
+}
+
+/// Parse Kraken side string to domain `OrderSide`.
+pub(crate) fn map_kraken_side(s: &str) -> anyhow::Result<OrderSide> {
+    match s {
+        "buy" => Ok(OrderSide::Buy),
+        "sell" => Ok(OrderSide::Sell),
+        other => Err(anyhow::anyhow!("unknown Kraken order side: {other}")),
+    }
+}
+
+/// Parse Kraken order type string to domain `OrderType`.
+pub(crate) fn map_kraken_order_type(s: &str) -> anyhow::Result<OrderType> {
+    match s {
+        "market" => Ok(OrderType::Market),
+        "limit" => Ok(OrderType::Limit),
+        "stop-loss" => Ok(OrderType::StopLoss),
+        "stop-loss-limit" => Ok(OrderType::StopLossLimit),
+        "take-profit" => Ok(OrderType::TakeProfit),
+        "take-profit-limit" => Ok(OrderType::TakeProfitLimit),
+        other => Err(anyhow::anyhow!("unknown Kraken order type: {other}")),
+    }
+}
+
+/// Map Kraken order status + executed volume to domain `OrderStatus`.
+pub(crate) fn map_order_status(status: &str, vol_exec: &Decimal) -> anyhow::Result<OrderStatus> {
+    match status {
+        "pending" => Ok(OrderStatus::Pending),
+        "open" => {
+            if vol_exec > &Decimal::ZERO {
+                Ok(OrderStatus::PartiallyFilled)
+            } else {
+                Ok(OrderStatus::Open)
+            }
+        }
+        "closed" => Ok(OrderStatus::Filled),
+        "canceled" | "cancelled" => Ok(OrderStatus::Cancelled),
+        "expired" => Ok(OrderStatus::Expired),
+        other => Err(anyhow::anyhow!("unknown Kraken order status: {other}")),
+    }
+}
+
+/// Infer the quote currency from a Kraken pair string.
+///
+/// Kraken pairs are typically structured as `XXBTZUSD`, `XETHZUSD`, `SOLUSD`.
+/// This extracts the quote portion and converts it via
+/// `kraken_asset_to_currency`.
+pub(crate) fn infer_quote_currency(pair: &str) -> Currency {
+    // Common quote suffixes (4-char legacy, then 3-char)
+    let quote_suffixes = ["ZUSD", "ZEUR", "ZGBP", "ZJPY", "ZCAD", "ZAUD"];
+    for suffix in &quote_suffixes {
+        if pair.ends_with(suffix) {
+            return kraken_asset_to_currency(suffix);
+        }
+    }
+    // Try 3-char suffix
+    if pair.len() > 3 {
+        return kraken_asset_to_currency(&pair[pair.len() - 3..]);
+    }
+    Currency::from_str_lossy(pair)
+}
+
+/// Map Kraken balance response to domain `Balance` list.
+///
+/// Skips zero balances. Kraken's Balance endpoint returns total only (no held
+/// info), so `available = total` and `held = 0`.
+pub(crate) fn map_balances(
+    raw: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<Vec<Balance>> {
+    let mut balances = Vec::new();
+    for (asset, amount_str) in raw {
+        let total = parse_decimal(amount_str, &format!("balance for {asset}"))?;
+        if total == Decimal::ZERO {
+            continue;
+        }
+        balances.push(Balance {
+            currency: kraken_asset_to_currency(asset),
+            total: Amount::new(total),
+            available: Amount::new(total),
+            held: Amount::new(Decimal::ZERO),
+        });
+    }
+    Ok(balances)
+}
+
+/// Map a Kraken open order to a domain `OpenOrder`.
+pub(crate) fn map_open_order(txid: &str, order: &KrakenOpenOrder) -> anyhow::Result<OpenOrder> {
+    let side = map_kraken_side(&order.descr.side)?;
+    let order_type = map_kraken_order_type(&order.descr.ordertype)?;
+    let vol = parse_decimal(&order.vol, "vol")?;
+    let vol_exec = parse_decimal(&order.vol_exec, "vol_exec")?;
+    let remaining = vol - vol_exec;
+
+    let limit_price = if order.descr.price != "0" && !order.descr.price.is_empty() {
+        Some(Price::new(parse_decimal(&order.descr.price, "price")?))
+    } else {
+        None
+    };
+
+    let stop_price = if order.descr.price2 != "0" && !order.descr.price2.is_empty() {
+        Some(Price::new(parse_decimal(&order.descr.price2, "price2")?))
+    } else {
+        None
+    };
+
+    let avg_fill_price = if !order.avg_price.is_empty() && order.avg_price != "0" {
+        let p = parse_decimal(&order.avg_price, "avg_price")?;
+        if p > Decimal::ZERO {
+            Some(Price::new(p))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let status = map_order_status(&order.status, &vol_exec)?;
+
+    let symbol = Symbol::new(&order.descr.pair).context("invalid pair in open order")?;
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let created_at = {
+        let secs = order.opentm.trunc() as i64;
+        let nanos = ((order.opentm.fract()) * 1_000_000_000.0) as u32;
+        DateTime::from_timestamp(secs, nanos).context("invalid opentm timestamp")?
+    };
+
+    Ok(OpenOrder {
+        order_id: OrderId::new(txid).context("invalid order txid")?,
+        request: OrderRequest {
+            symbol,
+            side,
+            order_type,
+            quantity: Quantity::new(vol).context("invalid order volume")?,
+            limit_price,
+            stop_price,
+            time_in_force: TimeInForce::GoodTilCancelled,
+        },
+        status,
+        filled_quantity: Quantity::new(vol_exec).context("invalid vol_exec")?,
+        remaining_quantity: Quantity::new(remaining).context("invalid remaining quantity")?,
+        average_fill_price: avg_fill_price,
+        created_at,
+    })
+}
+
+/// Map a Kraken trade history entry to a domain `OrderFill`.
+pub(crate) fn map_trade_history_entry(
+    trade_id_str: &str,
+    entry: &KrakenTradeHistoryEntry,
+) -> anyhow::Result<OrderFill> {
+    let side = map_kraken_side(&entry.side)?;
+    let fee_currency = infer_quote_currency(&entry.pair);
+
+    let symbol = Symbol::new(&entry.pair).context("invalid pair in trade history")?;
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let timestamp = {
+        let secs = entry.time.trunc() as i64;
+        let nanos = ((entry.time.fract()) * 1_000_000_000.0) as u32;
+        DateTime::from_timestamp(secs, nanos).context("invalid trade timestamp")?
+    };
+
+    Ok(OrderFill {
+        order_id: OrderId::new(&entry.ordertxid).context("invalid order txid in trade")?,
+        symbol,
+        side,
+        fill_price: Price::new(parse_decimal(&entry.price, "trade price")?),
+        fill_quantity: Quantity::new(parse_decimal(&entry.vol, "trade vol")?)
+            .context("invalid trade volume")?,
+        fee: Amount::new(parse_decimal(&entry.fee, "trade fee")?),
+        fee_currency,
+        timestamp,
+        trade_id: Some(SmolStr::new(trade_id_str)),
+    })
+}
+
+// ---- WebSocket v2 mappers ----
+
+/// Convert a Kraken WS v2 symbol (e.g., `"BTC/USD"`) to a `Symbol`.
+///
+/// Stores the WS symbol as-is — the caller/instrument registry can match
+/// on either the REST pair key or the WS format.
+pub(crate) fn ws_symbol_to_symbol(ws_symbol: &str) -> anyhow::Result<Symbol> {
+    Symbol::new(ws_symbol).context("invalid WS symbol")
+}
+
+/// Map a WS trade entry to a domain `Tick`.
+pub(crate) fn map_ws_trade(entry: &KrakenWsTradeEntry) -> anyhow::Result<Tick> {
+    let symbol = ws_symbol_to_symbol(&entry.symbol)?;
+    let time: DateTime<Utc> = entry
+        .timestamp
+        .parse()
+        .context("invalid WS trade timestamp")?;
+    let side = match entry.side.as_str() {
+        "buy" => Some(OrderSide::Buy),
+        "sell" => Some(OrderSide::Sell),
+        _ => None,
+    };
+
+    Ok(Tick {
+        time,
+        symbol,
+        exchange: SmolStr::new("kraken"),
+        price: Price::new(parse_decimal(&entry.price, "ws trade price")?),
+        quantity: Quantity::new(parse_decimal(&entry.qty, "ws trade qty")?)
+            .context("invalid ws trade qty")?,
+        side,
+        trade_id: Some(SmolStr::new(entry.trade_id.to_string())),
+    })
+}
+
+/// Map a WS ticker entry to a domain `TickerSnapshot`.
+pub(crate) fn map_ws_ticker(entry: &KrakenWsTickerEntry) -> anyhow::Result<TickerSnapshot> {
+    let symbol = ws_symbol_to_symbol(&entry.symbol)?;
+
+    Ok(TickerSnapshot {
+        symbol,
+        bid: Price::new(parse_decimal(&entry.bid, "ws ticker bid")?),
+        ask: Price::new(parse_decimal(&entry.ask, "ws ticker ask")?),
+        last: Price::new(parse_decimal(&entry.last, "ws ticker last")?),
+        volume_24h: Quantity::new(parse_decimal(&entry.volume, "ws ticker volume")?)
+            .context("invalid ws ticker volume")?,
+        timestamp: Utc::now(),
+    })
+}
+
+/// Map a WS book level to a domain `OrderBookLevel`.
+pub(crate) fn map_ws_book_level(level: &KrakenWsBookLevel) -> anyhow::Result<OrderBookLevel> {
+    Ok(OrderBookLevel {
+        price: Price::new(parse_decimal(&level.price, "ws book price")?),
+        quantity: Quantity::new(parse_decimal(&level.qty, "ws book qty")?)
+            .context("invalid ws book qty")?,
+    })
+}
+
+/// Map a WS execution entry to a domain `OrderFill`.
+pub(crate) fn map_ws_execution(entry: &KrakenWsExecEntry) -> anyhow::Result<OrderFill> {
+    let symbol = ws_symbol_to_symbol(&entry.symbol)?;
+    let side = map_kraken_side(&entry.side)?;
+    let timestamp: DateTime<Utc> = entry
+        .timestamp
+        .parse()
+        .context("invalid WS exec timestamp")?;
+
+    let fill_price = Price::new(parse_decimal(
+        entry
+            .last_price
+            .as_deref()
+            .context("execution missing last_price")?,
+        "ws exec price",
+    )?);
+    let fill_quantity = Quantity::new(parse_decimal(
+        entry
+            .last_qty
+            .as_deref()
+            .context("execution missing last_qty")?,
+        "ws exec qty",
+    )?)
+    .context("invalid ws exec qty")?;
+    let fee = Amount::new(parse_decimal(
+        entry.fee_paid.as_deref().unwrap_or("0"),
+        "ws exec fee",
+    )?);
+    let fee_currency = entry
+        .fee_currency
+        .as_deref()
+        .map_or(Currency::USD, Currency::from_str_lossy);
+
+    Ok(OrderFill {
+        order_id: OrderId::new(&entry.order_id).context("invalid ws exec order_id")?,
+        symbol,
+        side,
+        fill_price,
+        fill_quantity,
+        fee,
+        fee_currency,
+        timestamp,
+        trade_id: entry.trade_id.map(|id| SmolStr::new(id.to_string())),
+    })
+}
+
 fn parse_decimal(s: &str, field: &str) -> anyhow::Result<Decimal> {
     Decimal::from_str(s).with_context(|| format!("failed to parse {field}: {s}"))
 }
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -507,6 +830,285 @@ mod tests {
         let mapped = map_book_level(&level)?;
         assert_eq!(mapped.price.value(), dec!(67010.50));
         assert_eq!(mapped.quantity.value(), dec!(2.5));
+        Ok(())
+    }
+
+    // ---- Private endpoint mapper tests ----
+
+    #[test]
+    fn test_order_side_to_kraken() {
+        assert_eq!(order_side_to_kraken(OrderSide::Buy), "buy");
+        assert_eq!(order_side_to_kraken(OrderSide::Sell), "sell");
+    }
+
+    #[test]
+    fn test_order_type_to_kraken() {
+        assert_eq!(order_type_to_kraken(OrderType::Market), "market");
+        assert_eq!(order_type_to_kraken(OrderType::Limit), "limit");
+        assert_eq!(order_type_to_kraken(OrderType::StopLoss), "stop-loss");
+        assert_eq!(
+            order_type_to_kraken(OrderType::StopLossLimit),
+            "stop-loss-limit"
+        );
+        assert_eq!(order_type_to_kraken(OrderType::TakeProfit), "take-profit");
+        assert_eq!(
+            order_type_to_kraken(OrderType::TakeProfitLimit),
+            "take-profit-limit"
+        );
+    }
+
+    #[test]
+    fn test_time_in_force_to_kraken() -> anyhow::Result<()> {
+        assert_eq!(
+            time_in_force_to_kraken(TimeInForce::GoodTilCancelled)?,
+            None
+        );
+        assert_eq!(
+            time_in_force_to_kraken(TimeInForce::ImmediateOrCancel)?,
+            Some("IOC")
+        );
+        assert_eq!(
+            time_in_force_to_kraken(TimeInForce::FillOrKill)?,
+            Some("FOK")
+        );
+        assert!(time_in_force_to_kraken(TimeInForce::Day).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_kraken_side() -> anyhow::Result<()> {
+        assert_eq!(map_kraken_side("buy")?, OrderSide::Buy);
+        assert_eq!(map_kraken_side("sell")?, OrderSide::Sell);
+        assert!(map_kraken_side("unknown").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_kraken_order_type() -> anyhow::Result<()> {
+        assert_eq!(map_kraken_order_type("market")?, OrderType::Market);
+        assert_eq!(map_kraken_order_type("limit")?, OrderType::Limit);
+        assert_eq!(map_kraken_order_type("stop-loss")?, OrderType::StopLoss);
+        assert_eq!(
+            map_kraken_order_type("stop-loss-limit")?,
+            OrderType::StopLossLimit
+        );
+        assert!(map_kraken_order_type("unknown").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_order_status() -> anyhow::Result<()> {
+        assert_eq!(
+            map_order_status("pending", &Decimal::ZERO)?,
+            OrderStatus::Pending
+        );
+        assert_eq!(map_order_status("open", &Decimal::ZERO)?, OrderStatus::Open);
+        assert_eq!(
+            map_order_status("open", &dec!(0.5))?,
+            OrderStatus::PartiallyFilled
+        );
+        assert_eq!(
+            map_order_status("closed", &Decimal::ZERO)?,
+            OrderStatus::Filled
+        );
+        assert_eq!(
+            map_order_status("canceled", &Decimal::ZERO)?,
+            OrderStatus::Cancelled
+        );
+        assert_eq!(
+            map_order_status("expired", &Decimal::ZERO)?,
+            OrderStatus::Expired
+        );
+        assert!(map_order_status("unknown", &Decimal::ZERO).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_infer_quote_currency() {
+        assert_eq!(infer_quote_currency("XXBTZUSD"), Currency::USD);
+        assert_eq!(infer_quote_currency("XETHZEUR"), Currency::EUR);
+        assert_eq!(infer_quote_currency("SOLUSD"), Currency::USD);
+        assert_eq!(infer_quote_currency("DOTEUR"), Currency::EUR);
+    }
+
+    #[test]
+    fn test_map_balances() -> anyhow::Result<()> {
+        let mut raw = std::collections::HashMap::new();
+        raw.insert("XXBT".to_owned(), "1.5000".to_owned());
+        raw.insert("ZUSD".to_owned(), "10000.00".to_owned());
+        raw.insert("XETH".to_owned(), "0.0000".to_owned()); // zero, should be skipped
+
+        let balances = map_balances(&raw)?;
+        assert_eq!(balances.len(), 2);
+
+        let btc = balances.iter().find(|b| b.currency == Currency::BTC);
+        assert!(btc.is_some());
+        let btc = btc.context("missing BTC balance")?;
+        assert_eq!(btc.total.value(), dec!(1.5));
+        assert_eq!(btc.available.value(), dec!(1.5));
+        assert_eq!(btc.held.value(), Decimal::ZERO);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_balances_empty() -> anyhow::Result<()> {
+        let raw = std::collections::HashMap::new();
+        let balances = map_balances(&raw)?;
+        assert!(balances.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_open_order() -> anyhow::Result<()> {
+        let order = KrakenOpenOrder {
+            status: "open".into(),
+            descr: super::super::models::KrakenOpenOrderDescr {
+                pair: "XXBTZUSD".into(),
+                side: "buy".into(),
+                ordertype: "limit".into(),
+                price: "65000.0".into(),
+                price2: "0".into(),
+            },
+            vol: "0.001".into(),
+            vol_exec: "0.0005".into(),
+            cost: "32.50".into(),
+            fee: "0.05".into(),
+            avg_price: "65000.0".into(),
+            opentm: 1_616_663_594.0,
+        };
+
+        let mapped = map_open_order("OABCDE-12345-FGHIJ", &order)?;
+        assert_eq!(mapped.order_id.as_str(), "OABCDE-12345-FGHIJ");
+        assert_eq!(mapped.request.side, OrderSide::Buy);
+        assert_eq!(mapped.request.order_type, OrderType::Limit);
+        assert_eq!(mapped.status, OrderStatus::PartiallyFilled);
+        assert_eq!(mapped.filled_quantity.value(), dec!(0.0005));
+        assert_eq!(mapped.remaining_quantity.value(), dec!(0.0005));
+        assert!(mapped.average_fill_price.is_some());
+        assert_eq!(
+            mapped.request.limit_price.map(Price::value),
+            Some(dec!(65000.0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_trade_history_entry() -> anyhow::Result<()> {
+        let entry = KrakenTradeHistoryEntry {
+            ordertxid: "OABCDE-12345-FGHIJ".into(),
+            pair: "XXBTZUSD".into(),
+            side: "buy".into(),
+            ordertype: "market".into(),
+            price: "67000.50".into(),
+            vol: "0.001".into(),
+            cost: "67.0005".into(),
+            fee: "0.10".into(),
+            time: 1_616_663_594.0,
+            trade_id: Some(99999),
+        };
+
+        let fill = map_trade_history_entry("TABC-DEF-GHIJ", &entry)?;
+        assert_eq!(fill.order_id.as_str(), "OABCDE-12345-FGHIJ");
+        assert_eq!(fill.side, OrderSide::Buy);
+        assert_eq!(fill.fill_price.value(), dec!(67000.50));
+        assert_eq!(fill.fill_quantity.value(), dec!(0.001));
+        assert_eq!(fill.fee.value(), dec!(0.10));
+        assert_eq!(fill.fee_currency, Currency::USD);
+        assert_eq!(fill.trade_id.as_deref(), Some("TABC-DEF-GHIJ"));
+        Ok(())
+    }
+
+    // ---- WebSocket v2 mapper tests ----
+
+    #[test]
+    fn test_ws_symbol_to_symbol() -> anyhow::Result<()> {
+        let sym = ws_symbol_to_symbol("BTC/USD")?;
+        assert_eq!(sym.as_str(), "BTC/USD");
+        Ok(())
+    }
+
+    #[test]
+    fn test_ws_symbol_to_symbol_empty_fails() {
+        assert!(ws_symbol_to_symbol("").is_err());
+    }
+
+    #[test]
+    fn test_map_ws_trade() -> anyhow::Result<()> {
+        let entry = super::super::models::KrakenWsTradeEntry {
+            symbol: "BTC/USD".into(),
+            price: "67000.50".into(),
+            qty: "0.001".into(),
+            side: "buy".into(),
+            timestamp: "2024-01-15T10:30:00Z".into(),
+            trade_id: 12345,
+        };
+        let tick = map_ws_trade(&entry)?;
+
+        assert_eq!(tick.symbol.as_str(), "BTC/USD");
+        assert_eq!(tick.exchange.as_str(), "kraken");
+        assert_eq!(tick.price.value(), dec!(67000.50));
+        assert_eq!(tick.quantity.value(), dec!(0.001));
+        assert_eq!(tick.side, Some(OrderSide::Buy));
+        assert_eq!(tick.trade_id.as_deref(), Some("12345"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_ws_ticker() -> anyhow::Result<()> {
+        let entry = super::super::models::KrakenWsTickerEntry {
+            symbol: "BTC/USD".into(),
+            bid: "67000.00".into(),
+            ask: "67010.00".into(),
+            last: "67005.00".into(),
+            volume: "5000.0".into(),
+        };
+        let snap = map_ws_ticker(&entry)?;
+
+        assert_eq!(snap.symbol.as_str(), "BTC/USD");
+        assert_eq!(snap.bid.value(), dec!(67000.00));
+        assert_eq!(snap.ask.value(), dec!(67010.00));
+        assert_eq!(snap.last.value(), dec!(67005.00));
+        assert_eq!(snap.volume_24h.value(), dec!(5000.0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_ws_book_level() -> anyhow::Result<()> {
+        let level = super::super::models::KrakenWsBookLevel {
+            price: "67010.50".into(),
+            qty: "2.5".into(),
+        };
+        let mapped = map_ws_book_level(&level)?;
+        assert_eq!(mapped.price.value(), dec!(67010.50));
+        assert_eq!(mapped.quantity.value(), dec!(2.5));
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_ws_execution() -> anyhow::Result<()> {
+        let entry = super::super::models::KrakenWsExecEntry {
+            exec_type: "filled".into(),
+            order_id: "OABCDE-12345-FGHIJ".into(),
+            symbol: "BTC/USD".into(),
+            side: "buy".into(),
+            last_price: Some("67000.50".into()),
+            last_qty: Some("0.001".into()),
+            fee_paid: Some("0.10".into()),
+            fee_currency: Some("USD".into()),
+            timestamp: "2024-01-15T10:30:00Z".into(),
+            trade_id: Some(99999),
+        };
+        let fill = map_ws_execution(&entry)?;
+
+        assert_eq!(fill.order_id.as_str(), "OABCDE-12345-FGHIJ");
+        assert_eq!(fill.symbol.as_str(), "BTC/USD");
+        assert_eq!(fill.side, OrderSide::Buy);
+        assert_eq!(fill.fill_price.value(), dec!(67000.50));
+        assert_eq!(fill.fill_quantity.value(), dec!(0.001));
+        assert_eq!(fill.fee.value(), dec!(0.10));
+        assert_eq!(fill.fee_currency, Currency::USD);
+        assert_eq!(fill.trade_id.as_deref(), Some("99999"));
         Ok(())
     }
 }

@@ -6,5 +6,5 @@ pub mod traits;
 
 pub use config::{KrakenFuturesConfig, KrakenSpotConfig, PaperExchangeConfig};
 pub use error::ConnectivityError;
-pub use kraken::spot::KrakenSpotRestClient;
+pub use kraken::spot::{KrakenSpotRestClient, KrakenSpotWs};
 pub use traits::{AccountProvider, MarketDataProvider, OrderExecutor, StreamProvider};
