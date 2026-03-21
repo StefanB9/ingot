@@ -1,0 +1,37 @@
+[package]
+name = "ingot-connectivity"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+hmac.workspace = true
+ingot-core.workspace = true
+ingot-primitives.workspace = true
+ingot-storage = { version = "0.1.0", path = "../ingot-storage" }
+reqwest.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+smol_str.workspace = true
+thiserror.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+url.workspace = true
+rand.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+wiremock.workspace = true
