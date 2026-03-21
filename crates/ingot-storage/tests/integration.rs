@@ -593,3 +593,64 @@ async fn test_reconciliation_insert_and_get_latest() -> Result<()> {
 
     Ok(())
 }
+
+// --- Posting Engine → Storage Round-Trip ---
+
+#[tokio::test]
+async fn test_post_fill_storage_roundtrip() -> Result<()> {
+    use ingot_accounting::post_fill;
+    use ingot_core::OrderId;
+
+    let (_container, pool) = start_timescaledb().await?;
+    let repo = PgLedgerRepository::new(pool);
+
+    // Buy 1 BTC @ 67,000 USD, fee 17.42 USD
+    let fill = ingot_core::OrderFill {
+        order_id: OrderId::new("roundtrip-order").map_err(|e| anyhow::anyhow!("{e}"))?,
+        symbol: Symbol::new("BTCUSD")?,
+        side: OrderSide::Buy,
+        fill_price: Price::new(dec!(67000)),
+        fill_quantity: Quantity::new(dec!(1))?,
+        fee: Amount::new(dec!(17.42)),
+        fee_currency: Currency::USD,
+        timestamp: Utc::now(),
+        trade_id: Some(SmolStr::new("rt-trade-1")),
+    };
+
+    let txn = post_fill(
+        &fill,
+        Exchange::Kraken,
+        "spot",
+        &Currency::BTC,
+        &Currency::USD,
+        false,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    repo.insert_transaction(&txn).await?;
+
+    let balances = repo.get_account_balances().await?;
+
+    // BTC asset balance = +1.0 (debit)
+    let btc_asset = balances
+        .iter()
+        .find(|b| b.account_id.account_type == AccountType::Asset && b.currency == Currency::BTC)
+        .ok_or_else(|| anyhow::anyhow!("BTC asset balance not found"))?;
+    assert_eq!(btc_asset.balance, Amount::new(dec!(1)));
+
+    // USD asset balance = -(67000 + 17.42) = -67017.42 (two credits)
+    let usd_asset = balances
+        .iter()
+        .find(|b| b.account_id.account_type == AccountType::Asset && b.currency == Currency::USD)
+        .ok_or_else(|| anyhow::anyhow!("USD asset balance not found"))?;
+    assert_eq!(usd_asset.balance, Amount::new(dec!(-67017.42)));
+
+    // USD expense balance = +17.42 (debit)
+    let usd_expense = balances
+        .iter()
+        .find(|b| b.account_id.account_type == AccountType::Expense)
+        .ok_or_else(|| anyhow::anyhow!("USD expense balance not found"))?;
+    assert_eq!(usd_expense.balance, Amount::new(dec!(17.42)));
+
+    Ok(())
+}
