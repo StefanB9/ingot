@@ -107,7 +107,7 @@ impl PaperExchange {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let tick_rx = tick_feed.subscribe();
 
-        let rng = rand::rngs::StdRng::from_os_rng();
+        let rng: rand::rngs::StdRng = rand::make_rng();
 
         let inner = Arc::new(PaperExchangeInner {
             config,

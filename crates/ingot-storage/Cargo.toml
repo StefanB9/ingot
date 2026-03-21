@@ -7,6 +7,7 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+ingot-accounting = { version = "0.1.0", path = "../ingot-accounting" }
 ingot-core.workspace = true
 ingot-primitives.workspace = true
 rust_decimal.workspace = true
@@ -16,9 +17,7 @@ smol_str.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
-[lints]
-workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
@@ -32,3 +31,6 @@ sqlx.workspace = true
 testcontainers.workspace = true
 testcontainers-modules.workspace = true
 tokio.workspace = true
+
+[lints]
+workspace = true

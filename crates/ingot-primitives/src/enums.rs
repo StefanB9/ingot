@@ -73,6 +73,17 @@ pub enum CryptoContractType {
     FixedInverse,
 }
 
+impl Exchange {
+    pub fn as_str_lowercase(&self) -> &'static str {
+        match self {
+            Self::Kraken => "kraken",
+            Self::KrakenFutures => "kraken_futures",
+            Self::IBKR => "ibkr",
+            Self::Paper => "paper",
+        }
+    }
+}
+
 impl fmt::Display for AssetClass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -196,6 +207,14 @@ mod tests {
         assert_eq!(exchange, deserialized);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_exchange_as_str_lowercase() {
+        assert_eq!(Exchange::Kraken.as_str_lowercase(), "kraken");
+        assert_eq!(Exchange::KrakenFutures.as_str_lowercase(), "kraken_futures");
+        assert_eq!(Exchange::IBKR.as_str_lowercase(), "ibkr");
+        assert_eq!(Exchange::Paper.as_str_lowercase(), "paper");
     }
 
     #[test]

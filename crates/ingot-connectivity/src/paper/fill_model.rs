@@ -1,4 +1,5 @@
 use ingot_primitives::{Amount, OrderSide, Price, Quantity};
+use rand::RngExt;
 use rust_decimal::Decimal;
 
 /// Apply slippage to a price. Buy → price goes up, Sell → price goes down.

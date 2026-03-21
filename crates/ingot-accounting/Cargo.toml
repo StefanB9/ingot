@@ -1,5 +1,5 @@
 [package]
-name = "ingot-core"
+name = "ingot-accounting"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -12,10 +12,14 @@ rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smol_str.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 rust_decimal_macros.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

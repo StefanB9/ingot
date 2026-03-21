@@ -1,17 +1,23 @@
 use anyhow::Result;
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
+use ingot_accounting::{
+    AccountId, AccountType, Discrepancy, DiscrepancySeverity, EntryId, EntrySide, LedgerEntry,
+    ReconciliationResult, ReconciliationStatus, Transaction, TransactionId, TransactionType,
+};
 use ingot_core::{Instrument, InstrumentDetails, OhlcvBar, Tick};
 use ingot_primitives::{
     Amount, AssetClass, Currency, Exchange, OrderSide, Price, Quantity, Symbol,
 };
 use ingot_storage::{
-    instrument_repo::PgInstrumentRepository, ohlcv_repo::PgOhlcvRepository,
+    instrument_repo::PgInstrumentRepository, ledger_repo::PgLedgerRepository,
+    ohlcv_repo::PgOhlcvRepository, reconciliation_repo::PgReconciliationRepository,
     tick_repo::PgTickRepository,
 };
 use rust_decimal_macros::dec;
 use smol_str::SmolStr;
 use sqlx::PgPool;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt, runners::AsyncRunner};
+use uuid::Uuid;
 
 async fn start_timescaledb() -> Result<(ContainerAsync<GenericImage>, PgPool)> {
     let image = GenericImage::new("timescale/timescaledb", "latest-pg17")
@@ -465,6 +471,125 @@ async fn test_tick_range_filtering() -> Result<()> {
 
     assert_eq!(fetched.len(), 1);
     assert_eq!(fetched[0].price, Price::new(dec!(67000.0)));
+
+    Ok(())
+}
+
+// --- Ledger Repository Tests ---
+
+fn make_balanced_fee_transaction() -> Result<Transaction> {
+    let txn_id = TransactionId::new();
+    let now = Utc::now();
+
+    let debit_account = AccountId::new(
+        AccountType::Expense,
+        Exchange::Kraken,
+        "spot",
+        Currency::USD,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let credit_account =
+        AccountId::new(AccountType::Asset, Exchange::Kraken, "spot", Currency::USD)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let entries = vec![
+        LedgerEntry {
+            id: EntryId::new(),
+            transaction_id: txn_id.clone(),
+            account_id: debit_account,
+            side: EntrySide::Debit,
+            amount: Amount::new(dec!(17.42)),
+            currency: Currency::USD,
+            timestamp: now,
+            description: Some(SmolStr::new("trading fee")),
+        },
+        LedgerEntry {
+            id: EntryId::new(),
+            transaction_id: txn_id.clone(),
+            account_id: credit_account,
+            side: EntrySide::Credit,
+            amount: Amount::new(dec!(17.42)),
+            currency: Currency::USD,
+            timestamp: now,
+            description: Some(SmolStr::new("trading fee")),
+        },
+    ];
+
+    Ok(Transaction {
+        id: txn_id,
+        transaction_type: TransactionType::Fee,
+        entries,
+        timestamp: now,
+        reference_id: Some(SmolStr::new("order-123")),
+        metadata: None,
+    })
+}
+
+#[tokio::test]
+async fn test_ledger_insert_and_get_balances() -> Result<()> {
+    let (_container, pool) = start_timescaledb().await?;
+    let repo = PgLedgerRepository::new(pool);
+
+    let txn = make_balanced_fee_transaction()?;
+    repo.insert_transaction(&txn).await?;
+
+    let balances = repo.get_account_balances().await?;
+    assert_eq!(balances.len(), 2);
+
+    // Find expense account (debit side → positive balance)
+    let expense = balances
+        .iter()
+        .find(|b| b.account_id.account_type == AccountType::Expense)
+        .ok_or_else(|| anyhow::anyhow!("expense balance not found"))?;
+    assert_eq!(expense.balance, Amount::new(dec!(17.42)));
+
+    // Find asset account (credit side → negative balance since debit-based)
+    let asset = balances
+        .iter()
+        .find(|b| b.account_id.account_type == AccountType::Asset)
+        .ok_or_else(|| anyhow::anyhow!("asset balance not found"))?;
+    assert_eq!(asset.balance, Amount::new(dec!(-17.42)));
+
+    Ok(())
+}
+
+// --- Reconciliation Repository Tests ---
+
+#[tokio::test]
+async fn test_reconciliation_insert_and_get_latest() -> Result<()> {
+    let (_container, pool) = start_timescaledb().await?;
+    let repo = PgReconciliationRepository::new(pool);
+
+    let result = ReconciliationResult {
+        id: Uuid::now_v7(),
+        exchange: Exchange::Kraken,
+        timestamp: Utc::now(),
+        discrepancies: vec![Discrepancy {
+            currency: Currency::USD,
+            ledger_balance: Amount::new(dec!(1000)),
+            broker_balance: Amount::new(dec!(999.50)),
+            difference: Amount::new(dec!(0.50)),
+            severity: DiscrepancySeverity::Minor,
+        }],
+        status: ReconciliationStatus::Pass,
+    };
+
+    repo.insert_result(&result).await?;
+
+    let latest = repo
+        .get_latest(Exchange::Kraken)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("reconciliation result not found"))?;
+
+    assert_eq!(latest.exchange, Exchange::Kraken);
+    assert_eq!(latest.status, ReconciliationStatus::Pass);
+    assert_eq!(latest.discrepancies.len(), 1);
+    assert_eq!(latest.discrepancies[0].currency, Currency::USD);
+    assert_eq!(latest.discrepancies[0].difference, Amount::new(dec!(0.50)));
+
+    // Different exchange should return None
+    let paper = repo.get_latest(Exchange::Paper).await?;
+    assert!(paper.is_none());
 
     Ok(())
 }
