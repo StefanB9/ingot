@@ -1,10 +1,11 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ingot_accounting::{
-    AccountId, AccountType, Discrepancy, DiscrepancySeverity, EntryId, EntrySide, LedgerEntry,
-    ReconciliationResult, ReconciliationStatus, Transaction, TransactionId, TransactionType,
+    AccountId, AccountType, AccountingConfig, Discrepancy, DiscrepancySeverity, EntryId, EntrySide,
+    LedgerEntry, ReconciliationResult, ReconciliationStatus, Transaction, TransactionId,
+    TransactionType, reconcile,
 };
-use ingot_core::{Instrument, InstrumentDetails, OhlcvBar, Tick};
+use ingot_core::{Balance, Instrument, InstrumentDetails, OhlcvBar, Tick};
 use ingot_primitives::{
     Amount, AssetClass, Currency, Exchange, OrderSide, Price, Quantity, Symbol,
 };
@@ -17,7 +18,15 @@ use rust_decimal_macros::dec;
 use smol_str::SmolStr;
 use sqlx::PgPool;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt, runners::AsyncRunner};
-use uuid::Uuid;
+use uuid::{Timestamp, Uuid};
+
+fn uuid_v7_now() -> Uuid {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ts = Timestamp::from_unix(uuid::NoContext, now.as_secs(), now.subsec_nanos());
+    Uuid::new_v7(ts)
+}
 
 async fn start_timescaledb() -> Result<(ContainerAsync<GenericImage>, PgPool)> {
     let image = GenericImage::new("timescale/timescaledb", "latest-pg17")
@@ -561,7 +570,7 @@ async fn test_reconciliation_insert_and_get_latest() -> Result<()> {
     let repo = PgReconciliationRepository::new(pool);
 
     let result = ReconciliationResult {
-        id: Uuid::now_v7(),
+        id: uuid_v7_now(),
         exchange: Exchange::Kraken,
         timestamp: Utc::now(),
         discrepancies: vec![Discrepancy {
@@ -651,6 +660,379 @@ async fn test_post_fill_storage_roundtrip() -> Result<()> {
         .find(|b| b.account_id.account_type == AccountType::Expense)
         .ok_or_else(|| anyhow::anyhow!("USD expense balance not found"))?;
     assert_eq!(usd_expense.balance, Amount::new(dec!(17.42)));
+
+    Ok(())
+}
+
+// --- Balance Queries + Account Aggregation (Phase 1c.3) ---
+
+#[tokio::test]
+async fn test_get_balances_by_exchange() -> Result<()> {
+    use ingot_accounting::{post_fill, post_transfer};
+    use ingot_core::OrderId;
+
+    let (_container, pool) = start_timescaledb().await?;
+    let repo = PgLedgerRepository::new(pool);
+
+    // Insert a Kraken trade
+    let fill = ingot_core::OrderFill {
+        order_id: OrderId::new("exch-order-1").map_err(|e| anyhow::anyhow!("{e}"))?,
+        symbol: Symbol::new("BTCUSD")?,
+        side: OrderSide::Buy,
+        fill_price: Price::new(dec!(67000)),
+        fill_quantity: Quantity::new(dec!(1))?,
+        fee: Amount::new(dec!(0)),
+        fee_currency: Currency::USD,
+        timestamp: Utc::now(),
+        trade_id: Some(SmolStr::new("t-1")),
+    };
+    let kraken_txn = post_fill(
+        &fill,
+        Exchange::Kraken,
+        "spot",
+        &Currency::BTC,
+        &Currency::USD,
+        false,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    repo.insert_transaction(&kraken_txn).await?;
+
+    // Insert a Paper transfer
+    let paper_txn = post_transfer(
+        Exchange::Paper,
+        "spot",
+        Exchange::Paper,
+        "futures",
+        &Currency::USD,
+        Amount::new(dec!(5000)),
+        Utc::now(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    repo.insert_transaction(&paper_txn).await?;
+
+    // Query Kraken only
+    let kraken_balances = repo.get_balances_by_exchange(Exchange::Kraken).await?;
+    assert_eq!(kraken_balances.len(), 2); // BTC asset + USD asset
+    for b in &kraken_balances {
+        assert_eq!(b.account_id.exchange, Exchange::Kraken);
+    }
+
+    // Query Paper only
+    let paper_balances = repo.get_balances_by_exchange(Exchange::Paper).await?;
+    assert_eq!(paper_balances.len(), 2); // spot + futures
+    for b in &paper_balances {
+        assert_eq!(b.account_id.exchange, Exchange::Paper);
+    }
+
+    // Query IBKR → empty
+    let ibkr_balances = repo.get_balances_by_exchange(Exchange::IBKR).await?;
+    assert!(ibkr_balances.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_entries_since() -> Result<()> {
+    let (_container, pool) = start_timescaledb().await?;
+    let repo = PgLedgerRepository::new(pool);
+
+    // Insert a fee transaction at t1
+    let txn1 = make_balanced_fee_transaction()?;
+    repo.insert_transaction(&txn1).await?;
+
+    // Record the midpoint
+    let midpoint = Utc::now();
+
+    // Small delay to ensure different timestamps
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // Insert another transaction at t2
+    let txn2 = make_balanced_fee_transaction()?;
+    repo.insert_transaction(&txn2).await?;
+
+    // Query since midpoint → only t2 entries
+    let entries = repo.get_entries_since(midpoint).await?;
+    assert_eq!(entries.len(), 2); // 2 entries in the second transaction
+
+    // Verify entries are fully reconstructed
+    for entry in &entries {
+        assert!(entry.timestamp >= midpoint);
+        assert!(entry.side == EntrySide::Debit || entry.side == EntrySide::Credit);
+    }
+
+    // Query since epoch → all 4 entries
+    let all_entries = repo
+        .get_entries_since(DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")?.to_utc())
+        .await?;
+    assert_eq!(all_entries.len(), 4);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_trial_balance() -> Result<()> {
+    use ingot_accounting::post_fill;
+    use ingot_core::OrderId;
+
+    let (_container, pool) = start_timescaledb().await?;
+    let repo = PgLedgerRepository::new(pool);
+
+    // Insert a buy trade (4 entries: 2 trade legs + 2 fee legs)
+    let fill = ingot_core::OrderFill {
+        order_id: OrderId::new("tb-order-1").map_err(|e| anyhow::anyhow!("{e}"))?,
+        symbol: Symbol::new("BTCUSD")?,
+        side: OrderSide::Buy,
+        fill_price: Price::new(dec!(67000)),
+        fill_quantity: Quantity::new(dec!(1))?,
+        fee: Amount::new(dec!(17.42)),
+        fee_currency: Currency::USD,
+        timestamp: Utc::now(),
+        trade_id: Some(SmolStr::new("tb-trade-1")),
+    };
+    let txn = post_fill(
+        &fill,
+        Exchange::Kraken,
+        "spot",
+        &Currency::BTC,
+        &Currency::USD,
+        false,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    repo.insert_transaction(&txn).await?;
+
+    // Also insert a balanced fee transaction
+    let fee_txn = make_balanced_fee_transaction()?;
+    repo.insert_transaction(&fee_txn).await?;
+
+    let tb = repo.trial_balance().await?;
+
+    // Trade: debit 1 BTC + debit 17.42 USD (fee) = debits in mixed currencies
+    // Fee txn: debit 17.42 USD, credit 17.42 USD
+    // Total debits: 1 (BTC) + 17.42 (fee) + 17.42 (fee_txn) = numeric 35.84 + 1 =
+    // ... Actually amounts are mixed currencies so total is just sum of all
+    // amounts per side Trade debits: 1.0 + 17.42 = 18.42
+    // Trade credits: 67000 + 17.42 = 67017.42
+    // Fee txn debits: 17.42
+    // Fee txn credits: 17.42
+    // Total debits: 18.42 + 17.42 = 35.84
+    // Total credits: 67017.42 + 17.42 = 67034.84
+    // Not "balanced" in raw sum because trade is multi-currency
+    assert_eq!(tb.total_debits, Amount::new(dec!(35.84)));
+    assert_eq!(tb.total_credits, Amount::new(dec!(67034.84)));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_trial_balance_empty() -> Result<()> {
+    let (_container, pool) = start_timescaledb().await?;
+    let repo = PgLedgerRepository::new(pool);
+
+    let tb = repo.trial_balance().await?;
+    assert_eq!(tb.total_debits, Amount::new(dec!(0)));
+    assert_eq!(tb.total_credits, Amount::new(dec!(0)));
+    assert!(tb.is_balanced());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multi_transaction_balances() -> Result<()> {
+    use ingot_accounting::{post_fill, post_funding_rate, post_transfer};
+    use ingot_core::OrderId;
+
+    let (_container, pool) = start_timescaledb().await?;
+    let repo = PgLedgerRepository::new(pool);
+
+    // 1. Buy 1 BTC @ 67,000 USD, fee 17.42 USD on Kraken spot
+    let fill = ingot_core::OrderFill {
+        order_id: OrderId::new("multi-order-1").map_err(|e| anyhow::anyhow!("{e}"))?,
+        symbol: Symbol::new("BTCUSD")?,
+        side: OrderSide::Buy,
+        fill_price: Price::new(dec!(67000)),
+        fill_quantity: Quantity::new(dec!(1))?,
+        fee: Amount::new(dec!(17.42)),
+        fee_currency: Currency::USD,
+        timestamp: Utc::now(),
+        trade_id: Some(SmolStr::new("multi-t-1")),
+    };
+    let trade_txn = post_fill(
+        &fill,
+        Exchange::Kraken,
+        "spot",
+        &Currency::BTC,
+        &Currency::USD,
+        false,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    repo.insert_transaction(&trade_txn).await?;
+
+    // 2. Pay funding rate of 6.70 USD on Kraken futures
+    let funding_txn = post_funding_rate(
+        Exchange::Kraken,
+        "futures",
+        &Currency::USD,
+        Amount::new(dec!(6.70)),
+        Utc::now(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    repo.insert_transaction(&funding_txn).await?;
+
+    // 3. Transfer 10,000 USD from Kraken spot to Kraken futures
+    let transfer_txn = post_transfer(
+        Exchange::Kraken,
+        "spot",
+        Exchange::Kraken,
+        "futures",
+        &Currency::USD,
+        Amount::new(dec!(10000)),
+        Utc::now(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    repo.insert_transaction(&transfer_txn).await?;
+
+    // Verify all balances
+    let balances = repo.get_account_balances().await?;
+
+    // asset:kraken:spot:BTC = +1.0
+    let btc = balances
+        .iter()
+        .find(|b| b.account_id.to_string() == "asset:kraken:spot:BTC")
+        .ok_or_else(|| anyhow::anyhow!("BTC balance not found"))?;
+    assert_eq!(btc.balance, Amount::new(dec!(1)));
+
+    // asset:kraken:spot:USD = -(67000 + 17.42) - 10000 = -77017.42
+    let usd_spot = balances
+        .iter()
+        .find(|b| b.account_id.to_string() == "asset:kraken:spot:USD")
+        .ok_or_else(|| anyhow::anyhow!("USD spot balance not found"))?;
+    assert_eq!(usd_spot.balance, Amount::new(dec!(-77017.42)));
+
+    // asset:kraken:futures:USD = +10000 - 6.70 = +9993.30
+    let usd_futures = balances
+        .iter()
+        .find(|b| b.account_id.to_string() == "asset:kraken:futures:USD")
+        .ok_or_else(|| anyhow::anyhow!("USD futures balance not found"))?;
+    assert_eq!(usd_futures.balance, Amount::new(dec!(9993.30)));
+
+    // expense:kraken:fee:USD = +17.42
+    let fee = balances
+        .iter()
+        .find(|b| b.account_id.to_string() == "expense:kraken:fee:USD")
+        .ok_or_else(|| anyhow::anyhow!("fee balance not found"))?;
+    assert_eq!(fee.balance, Amount::new(dec!(17.42)));
+
+    // expense:kraken:funding:USD = +6.70
+    let funding = balances
+        .iter()
+        .find(|b| b.account_id.to_string() == "expense:kraken:funding:USD")
+        .ok_or_else(|| anyhow::anyhow!("funding balance not found"))?;
+    assert_eq!(funding.balance, Amount::new(dec!(6.70)));
+
+    // Verify exchange filtering works
+    let kraken_only = repo.get_balances_by_exchange(Exchange::Kraken).await?;
+    assert_eq!(kraken_only.len(), 5); // BTC spot, USD spot, USD futures, fee, funding
+
+    Ok(())
+}
+
+// --- Reconciliation Full Cycle (Phase 1c.5) ---
+
+#[tokio::test]
+async fn test_reconciliation_full_cycle() -> Result<()> {
+    use ingot_accounting::post_fill;
+    use ingot_core::OrderId;
+
+    let (_container, pool) = start_timescaledb().await?;
+    let ledger_repo = PgLedgerRepository::new(pool.clone());
+    let recon_repo = PgReconciliationRepository::new(pool);
+
+    // 1. Post a buy fill: 2 BTC @ 67,000 USD, fee 20 USD on Kraken
+    let fill = ingot_core::OrderFill {
+        order_id: OrderId::new("recon-order-1").map_err(|e| anyhow::anyhow!("{e}"))?,
+        symbol: Symbol::new("BTCUSD")?,
+        side: OrderSide::Buy,
+        fill_price: Price::new(dec!(67000)),
+        fill_quantity: Quantity::new(dec!(2))?,
+        fee: Amount::new(dec!(20)),
+        fee_currency: Currency::USD,
+        timestamp: Utc::now(),
+        trade_id: Some(SmolStr::new("recon-t-1")),
+    };
+    let txn = post_fill(
+        &fill,
+        Exchange::Kraken,
+        "spot",
+        &Currency::BTC,
+        &Currency::USD,
+        false,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    ledger_repo.insert_transaction(&txn).await?;
+
+    // 2. Get internal balances for Kraken
+    let ledger_balances = ledger_repo
+        .get_balances_by_exchange(Exchange::Kraken)
+        .await?;
+
+    // 3. Create mock broker balances (exact match for asset accounts)
+    let broker_balances = vec![
+        Balance {
+            currency: Currency::BTC,
+            total: Amount::new(dec!(2)),
+            available: Amount::new(dec!(2)),
+            held: Amount::new(dec!(0)),
+        },
+        Balance {
+            currency: Currency::USD,
+            total: Amount::new(dec!(-134020)), // -(67000*2 + 20)
+            available: Amount::new(dec!(-134020)),
+            held: Amount::new(dec!(0)),
+        },
+    ];
+
+    // 4. Reconcile — filter to asset accounts only (broker doesn't report expense
+    //    accounts)
+    let config = AccountingConfig::default();
+    let asset_balances: Vec<_> = ledger_balances
+        .iter()
+        .filter(|b| b.account_id.account_type == AccountType::Asset)
+        .cloned()
+        .collect();
+    let result = reconcile(Exchange::Kraken, &asset_balances, &broker_balances, &config);
+
+    assert_eq!(result.status, ReconciliationStatus::Pass);
+    assert_eq!(result.exchange, Exchange::Kraken);
+
+    // BTC: exact match
+    let btc_disc = result
+        .discrepancies
+        .iter()
+        .find(|d| d.currency == Currency::BTC)
+        .ok_or_else(|| anyhow::anyhow!("BTC discrepancy not found"))?;
+    assert_eq!(btc_disc.severity, DiscrepancySeverity::None);
+    assert_eq!(btc_disc.ledger_balance, Amount::new(dec!(2)));
+
+    // USD: exact match
+    let usd_disc = result
+        .discrepancies
+        .iter()
+        .find(|d| d.currency == Currency::USD)
+        .ok_or_else(|| anyhow::anyhow!("USD discrepancy not found"))?;
+    assert_eq!(usd_disc.severity, DiscrepancySeverity::None);
+
+    // 5. Store reconciliation result
+    recon_repo.insert_result(&result).await?;
+
+    // 6. Retrieve and verify round-trip
+    let latest = recon_repo
+        .get_latest(Exchange::Kraken)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("latest reconciliation not found"))?;
+
+    assert_eq!(latest.exchange, Exchange::Kraken);
+    assert_eq!(latest.status, ReconciliationStatus::Pass);
+    assert_eq!(latest.discrepancies.len(), 2);
 
     Ok(())
 }

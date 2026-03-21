@@ -55,6 +55,10 @@ impl EntryId {
         Self(uuid_v7_now())
     }
 
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
     pub fn as_uuid(&self) -> &Uuid {
         &self.0
     }
