@@ -1,14 +1,19 @@
 services:
-  postgres:
-    image: postgres:18.3
+  timescaledb:
+    image: timescale/timescaledb:latest-pg17
+    container_name: ingot-db
+    restart: unless-stopped
     ports:
       - "5432:5432"
     environment:
       POSTGRES_DB: ingot
       POSTGRES_USER: ingot_app
       POSTGRES_PASSWORD: ingot_dev
+      TS_TUNE_MEMORY: "2GB"
+      TS_TUNE_NUM_CPUS: "4"
     volumes:
-      - pgdata:/var/lib/postgresql
+      - ingot_db_data:/var/lib/postgresql/data
 
 volumes:
-  pgdata:
+  ingot_db_data:
+    name: ingot_db_data

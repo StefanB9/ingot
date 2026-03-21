@@ -1,0 +1,103 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT time, symbol, exchange, price, quantity, side, trade_id\n            FROM ticks\n            WHERE symbol = $1 AND exchange = $2 AND time >= $3 AND time < $4\n            ORDER BY time ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "time",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "ticks",
+            "name": "time"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "symbol",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "ticks",
+            "name": "symbol"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "exchange",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "ticks",
+            "name": "exchange"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "price",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "ticks",
+            "name": "price"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "quantity",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "ticks",
+            "name": "quantity"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "side",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "ticks",
+            "name": "side"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "trade_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "ticks",
+            "name": "trade_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "15ae6a960e62bab4fb438d9ac21d1c946f1306e58292c3c334ea058856037ee0"
+}

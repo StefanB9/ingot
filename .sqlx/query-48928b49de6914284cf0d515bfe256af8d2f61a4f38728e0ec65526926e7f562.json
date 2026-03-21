@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO instruments (symbol, asset_class, exchange, base_currency, quote_currency, tick_size, display_name, details_json, updated_at)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())\n            ON CONFLICT (symbol) DO UPDATE SET\n                asset_class = EXCLUDED.asset_class,\n                exchange = EXCLUDED.exchange,\n                base_currency = EXCLUDED.base_currency,\n                quote_currency = EXCLUDED.quote_currency,\n                tick_size = EXCLUDED.tick_size,\n                display_name = EXCLUDED.display_name,\n                details_json = EXCLUDED.details_json,\n                updated_at = NOW()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Numeric",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "48928b49de6914284cf0d515bfe256af8d2f61a4f38728e0ec65526926e7f562"
+}
