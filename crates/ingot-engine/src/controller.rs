@@ -12,7 +12,7 @@ use crate::{
 
 /// Stateful risk gatekeeper. Maintains running positions and NAV,
 /// gates every `OrderIntention` against configured risk limits.
-pub(crate) struct PortfolioController {
+pub struct PortfolioController {
     config: RiskConfig,
     positions: HashMap<Symbol, Position>,
     current_nav: Amount,

@@ -1,5 +1,5 @@
 use ingot_accounting::AccountingError;
-use ingot_engine::EngineError;
+use ingot_engine::{EngineError, StrategyId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BacktestError {
@@ -11,6 +11,9 @@ pub enum BacktestError {
 
     #[error("data is not sorted by time")]
     UnsortedData,
+
+    #[error("duplicate strategy ID: {0}")]
+    DuplicateStrategy(StrategyId),
 
     #[error("engine error: {0}")]
     Engine(#[from] EngineError),
@@ -27,7 +30,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_backtest_error_display() {
+    fn test_backtest_error_display() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(BacktestError::NoData.to_string(), "no data provided");
         assert_eq!(
             BacktestError::NoStrategies.to_string(),
@@ -37,10 +40,16 @@ mod tests {
             BacktestError::UnsortedData.to_string(),
             "data is not sorted by time"
         );
+        let sid = StrategyId::new("test-strat")?;
+        assert_eq!(
+            BacktestError::DuplicateStrategy(sid).to_string(),
+            "duplicate strategy ID: test-strat"
+        );
         assert_eq!(
             BacktestError::Exchange("timeout".into()).to_string(),
             "backtest exchange error: timeout"
         );
+        Ok(())
     }
 
     #[test]

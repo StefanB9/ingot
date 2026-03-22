@@ -257,6 +257,24 @@ impl BacktestExchange {
             .balances
             .clone()
     }
+
+    /// Last known prices per symbol.
+    pub fn last_prices(&self) -> HashMap<Symbol, Price> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_prices
+            .clone()
+    }
+
+    /// Symbol-to-currency mapping.
+    pub fn symbol_currencies(&self) -> HashMap<Symbol, (Currency, Currency)> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .symbol_currencies
+            .clone()
+    }
 }
 
 impl OrderExecutor for BacktestExchange {
