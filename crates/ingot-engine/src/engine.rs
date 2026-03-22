@@ -4,17 +4,20 @@ use ingot_accounting::post_fill;
 use ingot_connectivity::OrderExecutor;
 use ingot_core::{OrderBookSnapshot, OrderFill, TickerSnapshot};
 use ingot_primitives::{Currency, Symbol};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::{
+    sync::{broadcast, mpsc, watch},
+    task::JoinHandle,
+};
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::EngineConfig,
+    config::{EngineConfig, ScheduleConfig},
     controller::PortfolioController,
     error::EngineError,
     order_manager::OrderManager,
     strategy::{Strategy, StrategyContext, StrategyKind},
     traits::LedgerWriter,
-    types::{OrderIntention, RiskDecision},
+    types::{OrderIntention, RiskDecision, StrategyId},
 };
 
 /// Central event-driven engine orchestrator.
@@ -34,6 +37,7 @@ pub struct Engine<E, L> {
     latest_tickers: HashMap<Symbol, TickerSnapshot>,
     latest_order_books: HashMap<Symbol, OrderBookSnapshot>,
     symbol_currencies: HashMap<Symbol, (Currency, Currency)>,
+    schedules: Vec<ScheduleConfig>,
 }
 
 impl<E, L> Engine<E, L>
@@ -58,6 +62,7 @@ where
             latest_tickers: HashMap::new(),
             latest_order_books: HashMap::new(),
             symbol_currencies: HashMap::new(),
+            schedules: Vec::new(),
         }
     }
 
@@ -79,6 +84,28 @@ where
     /// Returns a clone of the shutdown sender for external shutdown signaling.
     pub fn shutdown_handle(&self) -> watch::Sender<bool> {
         self.shutdown_tx.clone()
+    }
+
+    /// Register a schedule for an existing strategy. The strategy must
+    /// already be registered. Rejects duplicate schedules for the same
+    /// strategy.
+    pub fn register_schedule(&mut self, config: ScheduleConfig) -> Result<(), EngineError> {
+        if !self
+            .strategies
+            .iter()
+            .any(|s| *s.id() == config.strategy_id)
+        {
+            return Err(EngineError::StrategyNotFound(config.strategy_id));
+        }
+        if self
+            .schedules
+            .iter()
+            .any(|s| s.strategy_id == config.strategy_id)
+        {
+            return Err(EngineError::DuplicateStrategyId(config.strategy_id));
+        }
+        self.schedules.push(config);
+        Ok(())
     }
 
     /// Run the engine event loop until shutdown is signaled.
@@ -109,6 +136,24 @@ where
             }
         }
 
+        // Spawn schedule timer tasks
+        let (schedule_tx, mut schedule_rx) = mpsc::channel::<StrategyId>(32);
+        let mut timer_handles: Vec<JoinHandle<()>> = Vec::new();
+        for schedule in &self.schedules {
+            let tx = schedule_tx.clone();
+            let shutdown = self.shutdown_rx.clone();
+            let strategy_id = schedule.strategy_id.clone();
+            let interval = schedule.interval_duration();
+            timer_handles.push(tokio::spawn(schedule_timer_task(
+                strategy_id,
+                interval,
+                tx,
+                shutdown,
+            )));
+        }
+        // Drop the original sender so the channel closes when all tasks end
+        drop(schedule_tx);
+
         loop {
             tokio::select! {
                 result = ticker_rx.recv() => {
@@ -126,11 +171,19 @@ where
                         self.handle_fill(fill).await?;
                     }
                 }
+                Some(strategy_id) = schedule_rx.recv() => {
+                    self.handle_schedule(strategy_id).await?;
+                }
                 _ = self.shutdown_rx.changed() => {
                     info!("shutdown signal received, exiting engine loop");
                     break;
                 }
             }
+        }
+
+        // Abort timer tasks
+        for handle in &timer_handles {
+            handle.abort();
         }
 
         // Shutdown all strategies
@@ -184,6 +237,35 @@ where
         for strategy in &mut self.strategies {
             let intentions = strategy.on_order_book(&book, &ctx);
             all_intentions.extend(intentions);
+        }
+
+        for intention in all_intentions {
+            process_intention(
+                intention,
+                &mut self.controller,
+                &mut self.order_manager,
+                &self.executor,
+                &self.latest_tickers,
+                &self.latest_order_books,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_schedule(&mut self, strategy_id: StrategyId) -> Result<(), EngineError> {
+        let ctx = build_context(
+            &self.controller,
+            &self.latest_tickers,
+            &self.latest_order_books,
+        );
+
+        let mut all_intentions = Vec::new();
+        for strategy in &mut self.strategies {
+            if *strategy.id() == strategy_id {
+                let intentions = strategy.on_schedule(&ctx);
+                all_intentions.extend(intentions);
+            }
         }
 
         for intention in all_intentions {
@@ -294,6 +376,28 @@ async fn process_intention<E: OrderExecutor>(
     Ok(())
 }
 
+async fn schedule_timer_task(
+    strategy_id: StrategyId,
+    interval: std::time::Duration,
+    tx: mpsc::Sender<StrategyId>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut timer = tokio::time::interval(interval);
+    timer.tick().await; // consume the immediate first tick
+    loop {
+        tokio::select! {
+            _ = timer.tick() => {
+                if tx.send(strategy_id.clone()).await.is_err() {
+                    break;
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -315,7 +419,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{RiskConfig, SmartOrderConfig},
+        config::{RiskConfig, ScheduleConfig, SmartOrderConfig},
         strategy::{MockStrategy, MockStrategyState, NoopStrategy},
         traits::LedgerWriter,
         types::StrategyId,
@@ -866,6 +970,191 @@ mod tests {
             "ledger should have 1 transaction"
         );
 
+        Ok(())
+    }
+
+    // ── Scheduler tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_register_schedule_unknown_strategy() -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let ledger = MockLedgerWriter::new();
+        let mut engine = Engine::new(executor, ledger, config);
+
+        let schedule = ScheduleConfig::new(StrategyId::new("nonexistent")?, 1000)?;
+        let result = engine.register_schedule(schedule);
+        assert!(matches!(result, Err(EngineError::StrategyNotFound(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_register_schedule_duplicate() -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let ledger = MockLedgerWriter::new();
+        let mut engine = Engine::new(executor, ledger, config);
+
+        let id = StrategyId::new("mock")?;
+        let mock = MockStrategy::new(
+            id.clone(),
+            Arc::new(Mutex::new(MockStrategyState::default())),
+        );
+        engine.register_strategy(StrategyKind::Mock(mock))?;
+
+        let s1 = ScheduleConfig::new(id.clone(), 1000)?;
+        let s2 = ScheduleConfig::new(id, 2000)?;
+        engine.register_schedule(s1)?;
+
+        let result = engine.register_schedule(s2);
+        assert!(matches!(result, Err(EngineError::DuplicateStrategyId(_))));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_scheduler_fires_at_interval() -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let ledger = MockLedgerWriter::new();
+        let mut engine = Engine::new(executor, ledger, config);
+
+        let state = Arc::new(Mutex::new(MockStrategyState::default()));
+        let id = StrategyId::new("sched")?;
+        let mock = MockStrategy::new(id.clone(), Arc::clone(&state));
+        engine.register_strategy(StrategyKind::Mock(mock))?;
+
+        let schedule = ScheduleConfig::new(id, 100)?; // 100ms interval
+        engine.register_schedule(schedule)?;
+
+        let (_ticker_tx, ticker_rx) = broadcast::channel(16);
+        let (_book_tx, book_rx) = broadcast::channel(16);
+        let (_fill_tx, fill_rx) = mpsc::channel(16);
+
+        let shutdown = engine.shutdown_handle();
+
+        let handle = tokio::spawn(async move { engine.run(ticker_rx, book_rx, fill_rx).await });
+
+        // With start_paused=true, sleep auto-advances time when all tasks block
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let _ = shutdown.send(true);
+        handle.await??;
+
+        let s = state
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        assert!(
+            s.on_schedule_count >= 2,
+            "expected >= 2 schedule calls, got {}",
+            s.on_schedule_count
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_scheduler_multiple_strategies_different_intervals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let ledger = MockLedgerWriter::new();
+        let mut engine = Engine::new(executor, ledger, config);
+
+        // Strategy A: 100ms interval
+        let state_a = Arc::new(Mutex::new(MockStrategyState::default()));
+        let id_a = StrategyId::new("fast")?;
+        let mock_a = MockStrategy::new(id_a.clone(), Arc::clone(&state_a));
+        engine.register_strategy(StrategyKind::Mock(mock_a))?;
+        engine.register_schedule(ScheduleConfig::new(id_a, 100)?)?;
+
+        // Strategy B: 200ms interval
+        let state_b = Arc::new(Mutex::new(MockStrategyState::default()));
+        let id_b = StrategyId::new("slow")?;
+        let mock_b = MockStrategy::new(id_b.clone(), Arc::clone(&state_b));
+        engine.register_strategy(StrategyKind::Mock(mock_b))?;
+        engine.register_schedule(ScheduleConfig::new(id_b, 200)?)?;
+
+        let (_ticker_tx, ticker_rx) = broadcast::channel(16);
+        let (_book_tx, book_rx) = broadcast::channel(16);
+        let (_fill_tx, fill_rx) = mpsc::channel(16);
+
+        let shutdown = engine.shutdown_handle();
+
+        let handle = tokio::spawn(async move { engine.run(ticker_rx, book_rx, fill_rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let _ = shutdown.send(true);
+        handle.await??;
+
+        let sa = state_a
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let sb = state_b
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+
+        assert!(
+            sa.on_schedule_count >= 2,
+            "fast strategy expected >= 2, got {}",
+            sa.on_schedule_count
+        );
+        assert!(
+            sb.on_schedule_count >= 1,
+            "slow strategy expected >= 1, got {}",
+            sb.on_schedule_count
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_scheduler_stops_on_shutdown() -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let ledger = MockLedgerWriter::new();
+        let mut engine = Engine::new(executor, ledger, config);
+
+        let state = Arc::new(Mutex::new(MockStrategyState::default()));
+        let id = StrategyId::new("sched")?;
+        let mock = MockStrategy::new(id.clone(), Arc::clone(&state));
+        engine.register_strategy(StrategyKind::Mock(mock))?;
+
+        let schedule = ScheduleConfig::new(id, 50)?; // 50ms interval
+        engine.register_schedule(schedule)?;
+
+        let (_ticker_tx, ticker_rx) = broadcast::channel(16);
+        let (_book_tx, book_rx) = broadcast::channel(16);
+        let (_fill_tx, fill_rx) = mpsc::channel(16);
+
+        let shutdown = engine.shutdown_handle();
+
+        let handle = tokio::spawn(async move { engine.run(ticker_rx, book_rx, fill_rx).await });
+
+        // Let timers fire a couple of times
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+        // Record count before shutdown
+        let count_before = {
+            let s = state
+                .lock()
+                .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+            s.on_schedule_count
+        };
+
+        let _ = shutdown.send(true);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await??;
+        assert!(result.is_ok());
+
+        // Advance more time — count should NOT increase after shutdown
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let s = state
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        assert_eq!(
+            s.on_schedule_count, count_before,
+            "schedule count should not increase after shutdown"
+        );
+        assert!(s.shutdown_called);
         Ok(())
     }
 }

@@ -172,6 +172,7 @@ pub(crate) struct MockStrategyState {
     pub on_ticker_count: usize,
     pub on_fill_count: usize,
     pub on_order_book_count: usize,
+    pub on_schedule_count: usize,
     pub shutdown_called: bool,
 }
 
@@ -184,6 +185,7 @@ pub(crate) struct MockStrategy {
     state: std::sync::Arc<std::sync::Mutex<MockStrategyState>>,
     ticker_intentions: Vec<OrderIntention>,
     fill_intentions: Vec<OrderIntention>,
+    schedule_intentions: Vec<OrderIntention>,
 }
 
 #[cfg(test)]
@@ -194,6 +196,7 @@ impl MockStrategy {
             state,
             ticker_intentions: Vec::new(),
             fill_intentions: Vec::new(),
+            schedule_intentions: Vec::new(),
         }
     }
 
@@ -202,9 +205,15 @@ impl MockStrategy {
         self
     }
 
-    #[allow(dead_code)] // Used by future engine tests (1d.6+)
+    #[allow(dead_code)] // Used by future engine tests (1d.7+)
     pub fn with_fill_intentions(mut self, intentions: Vec<OrderIntention>) -> Self {
         self.fill_intentions = intentions;
+        self
+    }
+
+    #[allow(dead_code)] // Used by future engine tests
+    pub fn with_schedule_intentions(mut self, intentions: Vec<OrderIntention>) -> Self {
+        self.schedule_intentions = intentions;
         self
     }
 }
@@ -249,7 +258,10 @@ impl Strategy for MockStrategy {
     }
 
     fn on_schedule(&mut self, _ctx: &StrategyContext) -> Vec<OrderIntention> {
-        Vec::new()
+        if let Ok(mut s) = self.state.lock() {
+            s.on_schedule_count += 1;
+        }
+        self.schedule_intentions.clone()
     }
 
     fn shutdown(&mut self) {

@@ -7,7 +7,7 @@ pub mod strategy;
 pub mod traits;
 pub mod types;
 
-pub use config::{EngineConfig, RiskConfig, SmartOrderConfig};
+pub use config::{EngineConfig, RiskConfig, ScheduleConfig, SmartOrderConfig};
 pub use engine::Engine;
 pub use error::EngineError;
 pub use strategy::{NoopStrategy, Strategy, StrategyContext, StrategyKind};

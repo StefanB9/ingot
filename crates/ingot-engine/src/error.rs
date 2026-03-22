@@ -43,6 +43,9 @@ pub enum EngineError {
     #[error("smart order: order book empty for {0}")]
     EmptyOrderBook(Symbol),
 
+    #[error("schedule interval must be greater than zero")]
+    InvalidScheduleInterval,
+
     #[error("connectivity error: {0}")]
     Connectivity(#[source] anyhow::Error),
 
@@ -146,6 +149,15 @@ mod tests {
             "smart order: order book empty for XXBTZUSD"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_engine_error_display_invalid_schedule_interval() {
+        let err = EngineError::InvalidScheduleInterval;
+        assert_eq!(
+            err.to_string(),
+            "schedule interval must be greater than zero"
+        );
     }
 
     #[test]

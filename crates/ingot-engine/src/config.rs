@@ -1,7 +1,11 @@
+use std::time::Duration;
+
 use ingot_primitives::{Amount, Currency, Exchange, Percentage};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
+
+use crate::{error::EngineError, types::StrategyId};
 
 /// Top-level engine configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,13 +41,42 @@ pub struct SmartOrderConfig {
     pub fallback_timeout_ms: u64,
 }
 
+/// Per-strategy schedule configuration for interval-based timers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleConfig {
+    pub strategy_id: StrategyId,
+    /// Timer interval in milliseconds.
+    pub interval_ms: u64,
+}
+
+impl ScheduleConfig {
+    /// Create a new schedule config. Returns error if interval is zero.
+    pub fn new(strategy_id: StrategyId, interval_ms: u64) -> Result<Self, EngineError> {
+        if interval_ms == 0 {
+            return Err(EngineError::InvalidScheduleInterval);
+        }
+        Ok(Self {
+            strategy_id,
+            interval_ms,
+        })
+    }
+
+    /// Convert the interval to a `std::time::Duration`.
+    pub fn interval_duration(&self) -> Duration {
+        Duration::from_millis(self.interval_ms)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use ingot_primitives::Exchange;
     use rust_decimal_macros::dec;
     use smol_str::SmolStr;
 
     use super::*;
+    use crate::types::StrategyId;
 
     fn sample_risk_config() -> Result<RiskConfig, Box<dyn std::error::Error>> {
         Ok(RiskConfig {
@@ -112,6 +145,37 @@ mod tests {
         assert!(deserialized.use_mid_price);
         assert_eq!(deserialized.offset_bps, dec!(5));
         assert_eq!(deserialized.fallback_timeout_ms, 30_000);
+        Ok(())
+    }
+
+    // ── ScheduleConfig ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_schedule_config_construction() -> Result<(), Box<dyn std::error::Error>> {
+        let id = StrategyId::new("rebalancer")?;
+        let config = ScheduleConfig::new(id.clone(), 5000)?;
+        assert_eq!(config.strategy_id, id);
+        assert_eq!(config.interval_ms, 5000);
+        assert_eq!(config.interval_duration(), Duration::from_secs(5));
+
+        // Zero interval rejected
+        let id2 = StrategyId::new("zero")?;
+        let result = ScheduleConfig::new(id2, 0);
+        assert!(matches!(
+            result,
+            Err(crate::error::EngineError::InvalidScheduleInterval)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_schedule_config_serde_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let id = StrategyId::new("momentum")?;
+        let config = ScheduleConfig::new(id, 10_000)?;
+        let json = serde_json::to_string(&config)?;
+        let deserialized: ScheduleConfig = serde_json::from_str(&json)?;
+        assert_eq!(deserialized.strategy_id, config.strategy_id);
+        assert_eq!(deserialized.interval_ms, 10_000);
         Ok(())
     }
 }
