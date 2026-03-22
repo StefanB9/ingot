@@ -1,6 +1,7 @@
-use ingot_primitives::{Amount, Currency, Percentage};
+use ingot_primitives::{Amount, Currency, Exchange, Percentage};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 
 /// Top-level engine configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +9,8 @@ pub struct EngineConfig {
     pub risk: RiskConfig,
     pub base_currency: Currency,
     pub smart_order: SmartOrderConfig,
+    pub exchange: Exchange,
+    pub venue: SmolStr,
 }
 
 /// Risk management parameters for the portfolio controller.
@@ -36,7 +39,9 @@ pub struct SmartOrderConfig {
 
 #[cfg(test)]
 mod tests {
+    use ingot_primitives::Exchange;
     use rust_decimal_macros::dec;
+    use smol_str::SmolStr;
 
     use super::*;
 
@@ -62,6 +67,8 @@ mod tests {
             risk: sample_risk_config()?,
             base_currency: Currency::USD,
             smart_order: sample_smart_order_config(),
+            exchange: Exchange::Paper,
+            venue: SmolStr::new("spot"),
         })
     }
 
@@ -74,6 +81,8 @@ mod tests {
         assert_eq!(deserialized.risk.global_stop_loss, Amount::new(dec!(10000)));
         assert!(deserialized.smart_order.use_mid_price);
         assert_eq!(deserialized.smart_order.fallback_timeout_ms, 30_000);
+        assert_eq!(deserialized.exchange, Exchange::Paper);
+        assert_eq!(deserialized.venue, SmolStr::new("spot"));
         Ok(())
     }
 
