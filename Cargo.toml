@@ -5,7 +5,7 @@ resolver = "3"
 members = [
     "crates/ingot-accounting",
     "crates/ingot-connectivity",
-    "crates/ingot-core",
+    "crates/ingot-core", "crates/ingot-engine",
     "crates/ingot-primitives",
     "crates/ingot-storage",
 ]

@@ -1,0 +1,27 @@
+[package]
+name = "ingot-engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ingot-accounting = { path = "../ingot-accounting" }
+ingot-connectivity = { path = "../ingot-connectivity" }
+ingot-core = { path = "../ingot-core" }
+ingot-primitives = { path = "../ingot-primitives" }
+anyhow.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+smol_str.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rust_decimal_macros.workspace = true
+serde_json.workspace = true
