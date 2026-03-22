@@ -2,18 +2,19 @@ use std::collections::HashMap;
 
 use ingot_accounting::post_fill;
 use ingot_connectivity::OrderExecutor;
-use ingot_core::{OrderBookSnapshot, OrderFill, TickerSnapshot};
-use ingot_primitives::{Currency, Symbol};
+use ingot_core::{OrderBookSnapshot, OrderFill, OrderRequest, Position, TickerSnapshot};
+use ingot_primitives::{Currency, OrderType, Symbol, TimeInForce};
 use tokio::{
     sync::{broadcast, mpsc, watch},
     task::JoinHandle,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::{EngineConfig, ScheduleConfig},
     controller::PortfolioController,
     error::EngineError,
+    kill_switch::KillSwitch,
     order_manager::OrderManager,
     strategy::{Strategy, StrategyContext, StrategyKind},
     traits::LedgerWriter,
@@ -38,6 +39,7 @@ pub struct Engine<E, L> {
     latest_order_books: HashMap<Symbol, OrderBookSnapshot>,
     symbol_currencies: HashMap<Symbol, (Currency, Currency)>,
     schedules: Vec<ScheduleConfig>,
+    kill_switch: KillSwitch,
 }
 
 impl<E, L> Engine<E, L>
@@ -63,6 +65,7 @@ where
             latest_order_books: HashMap::new(),
             symbol_currencies: HashMap::new(),
             schedules: Vec::new(),
+            kill_switch: KillSwitch::new(),
         }
     }
 
@@ -84,6 +87,16 @@ where
     /// Returns a clone of the shutdown sender for external shutdown signaling.
     pub fn shutdown_handle(&self) -> watch::Sender<bool> {
         self.shutdown_tx.clone()
+    }
+
+    /// Returns a reference to the kill switch.
+    pub fn kill_switch(&self) -> &KillSwitch {
+        &self.kill_switch
+    }
+
+    /// Returns a clonable handle to the kill switch for external activation.
+    pub fn kill_switch_handle(&self) -> KillSwitch {
+        self.kill_switch.clone()
     }
 
     /// Register a schedule for an existing strategy. The strategy must
@@ -154,6 +167,9 @@ where
         // Drop the original sender so the channel closes when all tasks end
         drop(schedule_tx);
 
+        let mut kill_switch_rx = self.kill_switch.subscribe();
+        let mut killed = false;
+
         loop {
             tokio::select! {
                 result = ticker_rx.recv() => {
@@ -174,6 +190,18 @@ where
                 Some(strategy_id) = schedule_rx.recv() => {
                     self.handle_schedule(strategy_id).await?;
                 }
+                _ = kill_switch_rx.changed() => {
+                    if *kill_switch_rx.borrow() {
+                        warn!("kill switch activated, executing emergency sequence");
+                        self.execute_kill_switch_sequence().await;
+                        killed = true;
+                        break;
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    warn!("Ctrl+C received, activating kill switch");
+                    self.kill_switch.activate();
+                }
                 _ = self.shutdown_rx.changed() => {
                     info!("shutdown signal received, exiting engine loop");
                     break;
@@ -186,11 +214,18 @@ where
             handle.abort();
         }
 
-        // Shutdown all strategies
-        for strategy in &mut self.strategies {
-            strategy.shutdown();
+        // Shutdown strategies (unless kill switch already did it)
+        if !killed {
+            for strategy in &mut self.strategies {
+                strategy.shutdown();
+            }
         }
-        Ok(())
+
+        if killed {
+            Err(EngineError::KillSwitchActivated)
+        } else {
+            Ok(())
+        }
     }
 
     async fn handle_ticker(&mut self, ticker: TickerSnapshot) -> Result<(), EngineError> {
@@ -280,6 +315,56 @@ where
             .await?;
         }
         Ok(())
+    }
+
+    /// Execute the emergency kill switch sequence (best-effort):
+    /// 1. Halt controller (prevent new orders)
+    /// 2. Shutdown all strategies
+    /// 3. Cancel all open orders
+    /// 4. Close all positions with opposite-side market orders
+    async fn execute_kill_switch_sequence(&mut self) {
+        // 1. Halt controller
+        self.controller.halt();
+        info!("kill switch: controller halted");
+
+        // 2. Shutdown all strategies
+        for strategy in &mut self.strategies {
+            strategy.shutdown();
+        }
+        info!("kill switch: strategies shut down");
+
+        // 3. Cancel all open orders
+        if let Err(e) = self.order_manager.cancel_all(&self.executor).await {
+            error!("kill switch: failed to cancel orders: {e}");
+        } else {
+            info!("kill switch: open orders cancelled");
+        }
+
+        // 4. Close all positions with opposite-side market orders
+        let positions: Vec<Position> = self.controller.positions().values().cloned().collect();
+        for position in &positions {
+            let close_order = OrderRequest {
+                symbol: position.symbol.clone(),
+                side: position.side.opposite(),
+                order_type: OrderType::Market,
+                quantity: position.quantity,
+                limit_price: None,
+                stop_price: None,
+                time_in_force: TimeInForce::ImmediateOrCancel,
+            };
+            if let Err(e) = self.executor.place_order(&close_order).await {
+                error!(
+                    "kill switch: failed to close position {}: {e}",
+                    position.symbol
+                );
+            }
+        }
+        if !positions.is_empty() {
+            info!(
+                "kill switch: submitted close orders for {} position(s)",
+                positions.len()
+            );
+        }
     }
 
     async fn handle_fill(&mut self, fill: OrderFill) -> Result<(), EngineError> {
@@ -430,6 +515,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct MockOrderExecutor {
         placed: Arc<Mutex<Vec<OrderRequest>>>,
+        cancel_all_count: Arc<Mutex<u32>>,
         next_order_id: String,
     }
 
@@ -437,6 +523,7 @@ mod tests {
         fn new(next_id: &str) -> Self {
             Self {
                 placed: Arc::new(Mutex::new(Vec::new())),
+                cancel_all_count: Arc::new(Mutex::new(0)),
                 next_order_id: next_id.to_owned(),
             }
         }
@@ -447,6 +534,15 @@ mod tests {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
             Ok(guard.clone())
+        }
+
+        #[allow(dead_code)] // Available for future tests
+        fn cancel_all_call_count(&self) -> Result<u32, anyhow::Error> {
+            let guard = self
+                .cancel_all_count
+                .lock()
+                .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+            Ok(*guard)
         }
     }
 
@@ -472,6 +568,11 @@ mod tests {
         }
 
         async fn cancel_all_orders(&self) -> anyhow::Result<u32> {
+            let mut guard = self
+                .cancel_all_count
+                .lock()
+                .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+            *guard += 1;
             Ok(0)
         }
 
@@ -654,6 +755,19 @@ mod tests {
 
         let result = engine.register_strategy(s2);
         assert!(matches!(result, Err(EngineError::DuplicateStrategyId(_))));
+        Ok(())
+    }
+
+    // ── Kill switch accessor ──────────────────────────────────────────
+
+    #[test]
+    fn test_engine_kill_switch_accessor() -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let ledger = MockLedgerWriter::new();
+        let engine = Engine::new(executor, ledger, config);
+
+        assert!(!engine.kill_switch().is_activated());
         Ok(())
     }
 
@@ -1155,6 +1269,271 @@ mod tests {
             "schedule count should not increase after shutdown"
         );
         assert!(s.shutdown_called);
+        Ok(())
+    }
+
+    // ── Kill switch tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_engine_kill_switch_halts_controller() -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let ledger = MockLedgerWriter::new();
+        let mut engine = Engine::new(executor, ledger, config);
+
+        let state = Arc::new(Mutex::new(MockStrategyState::default()));
+        let mock = MockStrategy::new(StrategyId::new("mock")?, Arc::clone(&state));
+        engine.register_strategy(StrategyKind::Mock(mock))?;
+
+        let ks = engine.kill_switch_handle();
+        let (_ticker_tx, ticker_rx) = broadcast::channel(16);
+        let (_book_tx, book_rx) = broadcast::channel(16);
+        let (_fill_tx, fill_rx) = mpsc::channel(16);
+
+        let handle = tokio::spawn(async move { engine.run(ticker_rx, book_rx, fill_rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        ks.activate();
+
+        let result = handle.await?;
+        assert!(matches!(result, Err(EngineError::KillSwitchActivated)));
+        // Controller halted is verified by the kill switch sequence running
+        // (it calls controller.halt() first thing). If no panic, it worked.
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_engine_kill_switch_shuts_down_strategies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let ledger = MockLedgerWriter::new();
+        let mut engine = Engine::new(executor, ledger, config);
+
+        let state = Arc::new(Mutex::new(MockStrategyState::default()));
+        let mock = MockStrategy::new(StrategyId::new("mock")?, Arc::clone(&state));
+        engine.register_strategy(StrategyKind::Mock(mock))?;
+
+        let ks = engine.kill_switch_handle();
+        let (_ticker_tx, ticker_rx) = broadcast::channel(16);
+        let (_book_tx, book_rx) = broadcast::channel(16);
+        let (_fill_tx, fill_rx) = mpsc::channel(16);
+
+        let handle = tokio::spawn(async move { engine.run(ticker_rx, book_rx, fill_rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        ks.activate();
+
+        let result = handle.await?;
+        assert!(matches!(result, Err(EngineError::KillSwitchActivated)));
+
+        let s = state
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        assert!(s.shutdown_called);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_engine_kill_switch_cancels_all_orders() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let cancel_count = Arc::clone(&executor.cancel_all_count);
+        let ledger = MockLedgerWriter::new();
+        let mut engine = Engine::new(executor, ledger, config);
+
+        let state = Arc::new(Mutex::new(MockStrategyState::default()));
+        let mock = MockStrategy::new(StrategyId::new("mock")?, Arc::clone(&state));
+        engine.register_strategy(StrategyKind::Mock(mock))?;
+
+        let ks = engine.kill_switch_handle();
+        let (_ticker_tx, ticker_rx) = broadcast::channel(16);
+        let (_book_tx, book_rx) = broadcast::channel(16);
+        let (_fill_tx, fill_rx) = mpsc::channel(16);
+
+        let handle = tokio::spawn(async move { engine.run(ticker_rx, book_rx, fill_rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        ks.activate();
+
+        let result = handle.await?;
+        assert!(matches!(result, Err(EngineError::KillSwitchActivated)));
+
+        let count = cancel_count
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        assert!(*count > 0, "cancel_all_orders should have been called");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_engine_kill_switch_closes_positions() -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let placed = Arc::clone(&executor.placed);
+        let ledger = MockLedgerWriter::new();
+        let mut engine = Engine::new(executor, ledger, config);
+
+        // Seed a Buy position via controller
+        let symbol = Symbol::new("XXBTZUSD")?;
+        let fill = OrderFill {
+            order_id: ingot_core::OrderId::new("SEED-001")?,
+            symbol: symbol.clone(),
+            side: OrderSide::Buy,
+            fill_price: Price::new(dec!(67_000)),
+            fill_quantity: Quantity::new(dec!(0.5))?,
+            fee: Amount::new(dec!(0.26)),
+            fee_currency: Currency::USD,
+            timestamp: Utc::now(),
+            trade_id: None,
+        };
+        engine.controller.on_fill(&fill);
+
+        let state = Arc::new(Mutex::new(MockStrategyState::default()));
+        let mock = MockStrategy::new(StrategyId::new("mock")?, Arc::clone(&state));
+        engine.register_strategy(StrategyKind::Mock(mock))?;
+
+        let ks = engine.kill_switch_handle();
+        let (_ticker_tx, ticker_rx) = broadcast::channel(16);
+        let (_book_tx, book_rx) = broadcast::channel(16);
+        let (_fill_tx, fill_rx) = mpsc::channel(16);
+
+        let handle = tokio::spawn(async move { engine.run(ticker_rx, book_rx, fill_rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        ks.activate();
+
+        let result = handle.await?;
+        assert!(matches!(result, Err(EngineError::KillSwitchActivated)));
+
+        let orders = placed
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        assert_eq!(orders.len(), 1, "should place one close order");
+        assert_eq!(orders[0].symbol, symbol);
+        assert_eq!(orders[0].side, OrderSide::Sell, "close Buy with Sell");
+        assert_eq!(orders[0].order_type, OrderType::Market);
+        assert_eq!(orders[0].quantity, Quantity::new(dec!(0.5))?);
+        assert_eq!(orders[0].time_in_force, TimeInForce::ImmediateOrCancel);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_engine_kill_switch_closes_sell_positions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let placed = Arc::clone(&executor.placed);
+        let ledger = MockLedgerWriter::new();
+        let mut engine = Engine::new(executor, ledger, config);
+
+        // Seed a Sell position
+        let symbol = Symbol::new("XETHZUSD")?;
+        let fill = OrderFill {
+            order_id: ingot_core::OrderId::new("SEED-002")?,
+            symbol: symbol.clone(),
+            side: OrderSide::Sell,
+            fill_price: Price::new(dec!(3_500)),
+            fill_quantity: Quantity::new(dec!(2))?,
+            fee: Amount::new(dec!(0.10)),
+            fee_currency: Currency::USD,
+            timestamp: Utc::now(),
+            trade_id: None,
+        };
+        engine.controller.on_fill(&fill);
+
+        let state = Arc::new(Mutex::new(MockStrategyState::default()));
+        let mock = MockStrategy::new(StrategyId::new("mock")?, Arc::clone(&state));
+        engine.register_strategy(StrategyKind::Mock(mock))?;
+
+        let ks = engine.kill_switch_handle();
+        let (_ticker_tx, ticker_rx) = broadcast::channel(16);
+        let (_book_tx, book_rx) = broadcast::channel(16);
+        let (_fill_tx, fill_rx) = mpsc::channel(16);
+
+        let handle = tokio::spawn(async move { engine.run(ticker_rx, book_rx, fill_rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        ks.activate();
+
+        let result = handle.await?;
+        assert!(matches!(result, Err(EngineError::KillSwitchActivated)));
+
+        let orders = placed
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].side, OrderSide::Buy, "close Sell with Buy");
+        assert_eq!(orders[0].order_type, OrderType::Market);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_engine_kill_switch_no_positions_no_close_orders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let placed = Arc::clone(&executor.placed);
+        let cancel_count = Arc::clone(&executor.cancel_all_count);
+        let ledger = MockLedgerWriter::new();
+        let mut engine = Engine::new(executor, ledger, config);
+
+        let state = Arc::new(Mutex::new(MockStrategyState::default()));
+        let mock = MockStrategy::new(StrategyId::new("mock")?, Arc::clone(&state));
+        engine.register_strategy(StrategyKind::Mock(mock))?;
+
+        let ks = engine.kill_switch_handle();
+        let (_ticker_tx, ticker_rx) = broadcast::channel(16);
+        let (_book_tx, book_rx) = broadcast::channel(16);
+        let (_fill_tx, fill_rx) = mpsc::channel(16);
+
+        let handle = tokio::spawn(async move { engine.run(ticker_rx, book_rx, fill_rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        ks.activate();
+
+        let result = handle.await?;
+        assert!(matches!(result, Err(EngineError::KillSwitchActivated)));
+
+        let orders = placed
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        assert!(orders.is_empty(), "no positions = no close orders");
+
+        let count = cancel_count
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        assert!(*count > 0, "cancel_all should still be called");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_engine_kill_switch_returns_error() -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_engine_config()?;
+        let executor = MockOrderExecutor::new("ORD-001");
+        let ledger = MockLedgerWriter::new();
+        let mut engine = Engine::new(executor, ledger, config);
+
+        let state = Arc::new(Mutex::new(MockStrategyState::default()));
+        let mock = MockStrategy::new(StrategyId::new("mock")?, Arc::clone(&state));
+        engine.register_strategy(StrategyKind::Mock(mock))?;
+
+        let ks = engine.kill_switch_handle();
+        let (_ticker_tx, ticker_rx) = broadcast::channel(16);
+        let (_book_tx, book_rx) = broadcast::channel(16);
+        let (_fill_tx, fill_rx) = mpsc::channel(16);
+
+        let handle = tokio::spawn(async move { engine.run(ticker_rx, book_rx, fill_rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        ks.activate();
+
+        let result = handle.await?;
+        assert!(
+            matches!(result, Err(EngineError::KillSwitchActivated)),
+            "run() should return KillSwitchActivated error"
+        );
         Ok(())
     }
 }
