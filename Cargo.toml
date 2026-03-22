@@ -3,7 +3,7 @@ cargo-features = ["panic-immediate-abort"]
 [workspace]
 resolver = "3"
 members = [
-    "crates/ingot-accounting",
+    "crates/ingot-accounting", "crates/ingot-backtest",
     "crates/ingot-connectivity",
     "crates/ingot-core", "crates/ingot-engine",
     "crates/ingot-primitives",
