@@ -10,7 +10,7 @@ use crate::{config::SmartOrderConfig, error::EngineError, types::OrderIntention}
 
 /// An order being tracked by the manager.
 #[derive(Debug, Clone)]
-pub(crate) struct TrackedOrder {
+pub struct TrackedOrder {
     pub order_id: OrderId,
     pub intention: OrderIntention,
     pub status: OrderStatus,
@@ -19,7 +19,7 @@ pub(crate) struct TrackedOrder {
 
 /// Bridges approved `OrderIntention`s to the broker, tracks order lifecycle,
 /// and computes smart limit prices from the order book.
-pub(crate) struct OrderManager {
+pub struct OrderManager {
     tracked_orders: HashMap<OrderId, TrackedOrder>,
     smart_config: SmartOrderConfig,
 }

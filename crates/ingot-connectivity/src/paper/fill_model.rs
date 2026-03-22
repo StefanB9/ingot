@@ -3,7 +3,7 @@ use rand::RngExt;
 use rust_decimal::Decimal;
 
 /// Apply slippage to a price. Buy → price goes up, Sell → price goes down.
-pub(crate) fn apply_slippage(price: Price, side: OrderSide, slippage_bps: Decimal) -> Price {
+pub fn apply_slippage(price: Price, side: OrderSide, slippage_bps: Decimal) -> Price {
     let factor = slippage_bps / Decimal::new(10_000, 0);
     let adjustment = price.value() * factor;
     match side {
@@ -13,7 +13,7 @@ pub(crate) fn apply_slippage(price: Price, side: OrderSide, slippage_bps: Decima
 }
 
 /// Calculate fee in quote currency.
-pub(crate) fn calculate_fee(fill_price: Price, fill_qty: Quantity, fee_bps: Decimal) -> Amount {
+pub fn calculate_fee(fill_price: Price, fill_qty: Quantity, fee_bps: Decimal) -> Amount {
     let notional = fill_price.value() * fill_qty.value();
     let fee = notional * fee_bps / Decimal::new(10_000, 0);
     Amount::new(fee)
@@ -21,7 +21,7 @@ pub(crate) fn calculate_fee(fill_price: Price, fill_qty: Quantity, fee_bps: Deci
 
 /// Determine partial fill quantity (random 20–80% of remaining).
 /// Returns `None` if partial fill should not trigger (based on probability).
-pub(crate) fn partial_fill_quantity(
+pub fn partial_fill_quantity(
     remaining: Quantity,
     probability: Decimal,
     rng: &mut impl rand::Rng,
@@ -48,7 +48,7 @@ pub(crate) fn partial_fill_quantity(
 /// Check if a tick price crosses a limit order.
 /// Buy limit: `tick_price <= limit_price`.
 /// Sell limit: `tick_price >= limit_price`.
-pub(crate) fn tick_crosses_limit(tick_price: Price, limit_price: Price, side: OrderSide) -> bool {
+pub fn tick_crosses_limit(tick_price: Price, limit_price: Price, side: OrderSide) -> bool {
     match side {
         OrderSide::Buy => tick_price <= limit_price,
         OrderSide::Sell => tick_price >= limit_price,
