@@ -109,6 +109,17 @@ impl fmt::Display for Exchange {
     }
 }
 
+impl OrderSide {
+    /// Returns the opposite side: Buy → Sell, Sell → Buy.
+    #[must_use]
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Buy => Self::Sell,
+            Self::Sell => Self::Buy,
+        }
+    }
+}
+
 impl fmt::Display for OrderSide {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -215,6 +226,12 @@ mod tests {
         assert_eq!(Exchange::KrakenFutures.as_str_lowercase(), "kraken_futures");
         assert_eq!(Exchange::IBKR.as_str_lowercase(), "ibkr");
         assert_eq!(Exchange::Paper.as_str_lowercase(), "paper");
+    }
+
+    #[test]
+    fn test_order_side_opposite() {
+        assert_eq!(OrderSide::Buy.opposite(), OrderSide::Sell);
+        assert_eq!(OrderSide::Sell.opposite(), OrderSide::Buy);
     }
 
     #[test]
