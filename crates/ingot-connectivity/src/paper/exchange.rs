@@ -13,7 +13,6 @@ use ingot_core::{
     Position, Tick,
 };
 use ingot_primitives::{Amount, Currency, OrderSide, OrderType, Price, Quantity, Symbol};
-use rand::SeedableRng;
 use rust_decimal::Decimal;
 use tokio::{
     sync::{Mutex, RwLock, broadcast, watch},
