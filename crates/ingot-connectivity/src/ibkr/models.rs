@@ -178,11 +178,48 @@ pub(crate) struct IbkrOrderRequest {
     pub listing_exchange: Option<String>,
 }
 
+/// Wrapper for POST /iserver/account/{id}/orders body
+#[derive(Debug, Serialize)]
+pub(crate) struct IbkrOrderSubmitWrapper {
+    pub orders: Vec<IbkrOrderRequest>,
+}
+
 /// Confirmation reply for POST /iserver/reply/{replyId}
 #[derive(Debug, Serialize)]
 #[allow(dead_code)]
 pub(crate) struct IbkrConfirmReply {
     pub confirmed: bool,
+}
+
+/// Live order from GET /iserver/account/orders (richer than IbkrOrderStatus)
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct IbkrLiveOrder {
+    #[serde(rename = "orderId")]
+    pub order_id: String,
+    pub conid: i64,
+    #[serde(rename = "orderType")]
+    pub order_type: String,
+    pub side: String,
+    pub price: Option<f64>,
+    #[serde(rename = "auxPrice")]
+    pub aux_price: Option<f64>,
+    pub quantity: f64,
+    #[serde(rename = "filledQuantity")]
+    pub filled_quantity: f64,
+    #[serde(rename = "remainingQuantity")]
+    pub remaining_quantity: f64,
+    pub status: String,
+    #[serde(rename = "timeInForce")]
+    pub time_in_force: Option<String>,
+    pub ticker: Option<String>,
+}
+
+/// Response wrapper for GET /iserver/account/orders
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct IbkrLiveOrdersResponse {
+    pub orders: Vec<IbkrLiveOrder>,
 }
 
 #[cfg(test)]

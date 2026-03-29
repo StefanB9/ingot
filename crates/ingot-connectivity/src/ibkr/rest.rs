@@ -1,12 +1,33 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
+use ingot_core::{
+    Instrument, OhlcvBar, OpenOrder, OrderBookSnapshot, OrderId, Tick, TickerSnapshot,
+};
+use ingot_primitives::Symbol;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::RwLock;
 use tracing::instrument;
 
-use super::{contract_registry::IbkrContractRegistry, error::IbkrError, session::SessionManager};
-use crate::{config::IbkrConfig, error::ConnectivityError, rate_limiter::RateLimiter};
+use super::{
+    contract_registry::IbkrContractRegistry,
+    error::IbkrError,
+    mapper,
+    models::{
+        IbkrConfirmReply, IbkrContractDetail, IbkrContractSearchResult, IbkrHistoryResponse,
+        IbkrLiveOrdersResponse, IbkrMarketSnapshot, IbkrOrderRequest, IbkrOrderStatus,
+        IbkrOrderSubmitWrapper,
+    },
+    session::SessionManager,
+};
+use crate::{
+    config::IbkrConfig,
+    error::ConnectivityError,
+    rate_limiter::RateLimiter,
+    traits::{MarketDataProvider, OrderExecutor},
+};
 
 pub(crate) struct IbkrRestClient {
     session: SessionManager,
@@ -171,6 +192,89 @@ impl IbkrRestClient {
         &self.config
     }
 
+    /// Search for contracts and register them in the cache.
+    /// Returns instruments found for the given query string.
+    #[instrument(skip(self))]
+    pub async fn search_contracts(&self, query: &str) -> anyhow::Result<Vec<Instrument>> {
+        let results: Vec<IbkrContractSearchResult> = self
+            .get(
+                "/iserver/secdef/search",
+                &[("symbol", query), ("name", "true")],
+            )
+            .await
+            .context("contract search failed")?;
+
+        let mut instruments = Vec::new();
+        for result in &results {
+            let detail: IbkrContractDetail = self
+                .get(&format!("/iserver/contract/{}/info", result.conid), &[])
+                .await
+                .with_context(|| {
+                    format!("failed to fetch contract detail for conid {}", result.conid)
+                })?;
+
+            let instrument = mapper::contract_detail_to_instrument(&detail).with_context(|| {
+                format!("failed to map contract detail for conid {}", result.conid)
+            })?;
+
+            let mut reg = self.registry.write().await;
+            reg.register(detail.con_id, instrument.symbol.clone(), instrument.clone());
+            drop(reg);
+
+            instruments.push(instrument);
+        }
+
+        Ok(instruments)
+    }
+
+    /// DELETE request with session management and 401 retry.
+    #[instrument(skip(self))]
+    pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        self.rate_limiter
+            .acquire()
+            .await
+            .context("rate limiter acquire failed")?;
+        self.session
+            .ensure_authenticated()
+            .await
+            .context("pre-request auth check failed")?;
+
+        let url = format!("{}{path}", self.session.base_url());
+
+        let resp = self
+            .session
+            .http()
+            .delete(&url)
+            .send()
+            .await
+            .map_err(ConnectivityError::Http)
+            .context("DELETE request failed")?;
+
+        if resp.status().as_u16() == 401 {
+            self.session
+                .authenticate()
+                .await
+                .context("re-authentication after 401 failed")?;
+
+            let resp = self
+                .session
+                .http()
+                .delete(&url)
+                .send()
+                .await
+                .map_err(ConnectivityError::Http)
+                .context("DELETE retry after 401 failed")?;
+
+            return self.parse_response(resp).await;
+        }
+
+        if resp.status().as_u16() == 429 {
+            return Err(IbkrError::PacingViolation.into());
+        }
+
+        self.parse_response(resp).await
+    }
+
     // ── Private ──
 
     async fn parse_response<T: DeserializeOwned>(
@@ -198,20 +302,303 @@ impl IbkrRestClient {
     }
 }
 
+impl MarketDataProvider for IbkrRestClient {
+    #[instrument(skip(self))]
+    async fn fetch_instruments(&self) -> anyhow::Result<Vec<Instrument>> {
+        let reg = self.registry.read().await;
+        let instruments = reg
+            .all_instruments()
+            .into_iter()
+            .map(|arc| (**arc).clone())
+            .collect();
+        Ok(instruments)
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_ohlcv(
+        &self,
+        symbol: &Symbol,
+        interval: &str,
+        since: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<Vec<OhlcvBar>> {
+        let reg = self.registry.read().await;
+        let conid = reg
+            .conid_for_symbol(symbol)
+            .with_context(|| format!("symbol {} not in contract registry", symbol.as_str()))?;
+        drop(reg);
+
+        let bar = mapper::ibkr_interval(interval).context("invalid interval")?;
+
+        // Compute period from `since` or use a reasonable default
+        let period = match since {
+            Some(ts) => {
+                let days = (Utc::now() - ts).num_days().max(1);
+                if days <= 1 {
+                    "1d"
+                } else if days <= 7 {
+                    "1w"
+                } else if days <= 30 {
+                    "1m"
+                } else if days <= 90 {
+                    "3m"
+                } else if days <= 365 {
+                    "1y"
+                } else {
+                    "5y"
+                }
+            }
+            None => "1m",
+        };
+
+        let conid_str = conid.to_string();
+        let resp: IbkrHistoryResponse = self
+            .get(
+                "/iserver/marketdata/history",
+                &[("conid", &conid_str), ("bar", bar), ("period", period)],
+            )
+            .await
+            .context("failed to fetch OHLCV data")?;
+
+        resp.data
+            .iter()
+            .map(|b| mapper::history_bar_to_ohlcv(symbol.clone(), interval, b))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .context("failed to map history bars")
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_trades(
+        &self,
+        _symbol: &Symbol,
+        _since: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<(Vec<Tick>, Option<DateTime<Utc>>)> {
+        anyhow::bail!("IBKR Client Portal API does not support trade-level data")
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_ticker(&self, symbol: &Symbol) -> anyhow::Result<TickerSnapshot> {
+        let reg = self.registry.read().await;
+        let conid = reg
+            .conid_for_symbol(symbol)
+            .with_context(|| format!("symbol {} not in contract registry", symbol.as_str()))?;
+        drop(reg);
+
+        let conid_str = conid.to_string();
+        let snapshots: Vec<IbkrMarketSnapshot> = self
+            .get(
+                "/iserver/marketdata/snapshot",
+                &[("conids", &conid_str), ("fields", "31,84,86,87")],
+            )
+            .await
+            .context("failed to fetch market snapshot")?;
+
+        let snap = snapshots
+            .into_iter()
+            .next()
+            .context("empty snapshot response")?;
+
+        mapper::market_snapshot_to_ticker(symbol.clone(), &snap)
+            .context("failed to map market snapshot to ticker")
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_order_book(
+        &self,
+        symbol: &Symbol,
+        _depth: u32,
+    ) -> anyhow::Result<OrderBookSnapshot> {
+        let reg = self.registry.read().await;
+        let conid = reg
+            .conid_for_symbol(symbol)
+            .with_context(|| format!("symbol {} not in contract registry", symbol.as_str()))?;
+        drop(reg);
+
+        let conid_str = conid.to_string();
+        let snapshots: Vec<IbkrMarketSnapshot> = self
+            .get(
+                "/iserver/marketdata/snapshot",
+                &[("conids", &conid_str), ("fields", "84,86")],
+            )
+            .await
+            .context("failed to fetch order book snapshot")?;
+
+        let snap = snapshots
+            .into_iter()
+            .next()
+            .context("empty snapshot response")?;
+
+        mapper::snapshot_to_order_book(symbol.clone(), &snap)
+            .context("failed to map snapshot to order book")
+    }
+}
+
+impl OrderExecutor for IbkrRestClient {
+    #[instrument(skip(self))]
+    async fn place_order(&self, request: &ingot_core::OrderRequest) -> anyhow::Result<OrderId> {
+        let reg = self.registry.read().await;
+        let conid = reg.conid_for_symbol(&request.symbol).with_context(|| {
+            format!(
+                "symbol {} not in contract registry",
+                request.symbol.as_str()
+            )
+        })?;
+        let instrument = reg
+            .instrument_for_conid(conid)
+            .context("instrument not found for conid")?;
+        let sec_type = mapper::asset_class_to_sec_type(instrument.asset_class);
+        drop(reg);
+
+        let order_type_str = mapper::order_type_to_ibkr(request.order_type)?;
+        let side_str = mapper::order_side_to_ibkr(request.side);
+        let tif_str = mapper::tif_to_ibkr(request.time_in_force)?;
+        let quantity_f64 = request
+            .quantity
+            .value()
+            .to_f64()
+            .context("quantity conversion to f64 failed")?;
+
+        let price = request.limit_price.and_then(|p| p.value().to_f64());
+        let aux_price = request.stop_price.and_then(|p| p.value().to_f64());
+
+        let ibkr_order = IbkrOrderRequest {
+            acct_id: self.config.account_id.clone(),
+            conid,
+            sec_type: sec_type.into(),
+            order_type: order_type_str.into(),
+            side: side_str.into(),
+            quantity: quantity_f64,
+            price,
+            aux_price,
+            tif: tif_str.into(),
+            listing_exchange: None,
+        };
+
+        let wrapper = IbkrOrderSubmitWrapper {
+            orders: vec![ibkr_order],
+        };
+
+        let reply: Vec<serde_json::Value> = self
+            .post(
+                &format!("/iserver/account/{}/orders", self.config.account_id),
+                &wrapper,
+            )
+            .await
+            .context("order placement failed")?;
+
+        let item = reply
+            .into_iter()
+            .next()
+            .context("empty order reply from IBKR")?;
+
+        // Success: {"order_id": "...", "order_status": "..."}
+        if let Some(order_id) = item.get("order_id").and_then(|v| v.as_str()) {
+            return OrderId::new(order_id).context("invalid order ID from IBKR");
+        }
+
+        // Confirmation needed: {"id": "...", "message": [...]}
+        if let Some(reply_id) = item.get("id").and_then(|v| v.as_str()) {
+            let confirm = IbkrConfirmReply { confirmed: true };
+            let confirmed: Vec<serde_json::Value> = self
+                .post(&format!("/iserver/reply/{reply_id}"), &confirm)
+                .await
+                .context("order confirmation failed")?;
+
+            let confirmed_item = confirmed
+                .into_iter()
+                .next()
+                .context("empty confirmation reply")?;
+            let order_id = confirmed_item
+                .get("order_id")
+                .and_then(|v| v.as_str())
+                .context("no order_id in confirmation reply")?;
+            return OrderId::new(order_id).context("invalid order ID from IBKR confirmation");
+        }
+
+        anyhow::bail!("unexpected order reply format from IBKR: {item:?}")
+    }
+
+    #[instrument(skip(self))]
+    async fn cancel_order(&self, order_id: &OrderId) -> anyhow::Result<()> {
+        let _: serde_json::Value = self
+            .delete(&format!(
+                "/iserver/account/{}/order/{}",
+                self.config.account_id,
+                order_id.as_str()
+            ))
+            .await
+            .context("order cancellation failed")?;
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn cancel_all_orders(&self) -> anyhow::Result<u32> {
+        let resp: IbkrLiveOrdersResponse = self
+            .get("/iserver/account/orders", &[])
+            .await
+            .context("failed to fetch open orders")?;
+
+        let mut count = 0u32;
+        for order in &resp.orders {
+            let oid = OrderId::new(&order.order_id)
+                .with_context(|| format!("invalid order id: {}", order.order_id))?;
+            self.cancel_order(&oid)
+                .await
+                .with_context(|| format!("failed to cancel order {}", order.order_id))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    #[instrument(skip(self))]
+    async fn get_order_status(&self, order_id: &OrderId) -> anyhow::Result<OpenOrder> {
+        let status: IbkrOrderStatus = self
+            .get(
+                &format!("/iserver/account/order/status/{}", order_id.as_str()),
+                &[],
+            )
+            .await
+            .context("failed to fetch order status")?;
+
+        let reg = self.registry.read().await;
+        mapper::ibkr_order_status_to_open_order(&status, &reg).context("failed to map order status")
+    }
+
+    #[instrument(skip(self))]
+    async fn get_open_orders(&self) -> anyhow::Result<Vec<OpenOrder>> {
+        let resp: IbkrLiveOrdersResponse = self
+            .get("/iserver/account/orders", &[])
+            .await
+            .context("failed to fetch open orders")?;
+
+        let reg = self.registry.read().await;
+        resp.orders
+            .iter()
+            .map(|o| mapper::ibkr_live_order_to_open_order(o, &reg))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .context("failed to map open orders")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use anyhow::Context;
+    use ingot_primitives::{AssetClass, Currency, Exchange, Price, Quantity};
     use reqwest::Client;
+    use rust_decimal_macros::dec;
     use serde::Deserialize;
+    use smol_str::SmolStr;
     use wiremock::{
         Mock, MockServer, Request, Respond, ResponseTemplate,
         matchers::{method, path},
     };
 
     use super::*;
-    use crate::ibkr::session::SessionManager;
+    use crate::{
+        ibkr::session::SessionManager,
+        traits::{MarketDataProvider, OrderExecutor},
+    };
 
     fn test_config(base_url: &str) -> IbkrConfig {
         IbkrConfig {
@@ -403,6 +790,610 @@ mod tests {
         );
         // Verify the endpoint was hit twice (401 + retry)
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    // ── Helper: pre-register a symbol in the registry ──
+
+    async fn register_aapl(client: &IbkrRestClient) -> anyhow::Result<()> {
+        let symbol = ingot_primitives::Symbol::new("AAPL")?;
+        let instrument = Instrument {
+            symbol: symbol.clone(),
+            asset_class: AssetClass::Equity,
+            exchange: Exchange::IBKR,
+            base_currency: Currency::USD,
+            quote_currency: Currency::USD,
+            tick_size: Price::new(dec!(0.01)),
+            display_name: SmolStr::new("Apple Inc"),
+            details: ingot_core::InstrumentDetails::Equity {
+                isin: None,
+                lot_size: Quantity::new(dec!(1))?,
+                fractional: false,
+            },
+        };
+        let mut reg = client.registry().write().await;
+        reg.register(265598, symbol, instrument);
+        Ok(())
+    }
+
+    // ── Test 20: search_contracts ──
+
+    #[tokio::test]
+    async fn test_search_contracts() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+
+        // Mock search endpoint
+        Mock::given(method("GET"))
+            .and(path("/iserver/secdef/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "conid": 265598,
+                    "company_name": "Apple Inc",
+                    "symbol": "AAPL",
+                    "sec_type": "STK",
+                    "exchange": "NASDAQ",
+                    "currency": "USD"
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Mock contract detail endpoint
+        Mock::given(method("GET"))
+            .and(path("/iserver/contract/265598/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "con_id": 265598,
+                "symbol": "AAPL",
+                "sec_type": "STK",
+                "exchange": "SMART",
+                "currency": "USD",
+                "company_name": "Apple Inc"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let instruments = client
+            .search_contracts("AAPL")
+            .await
+            .context("search_contracts should succeed")?;
+
+        assert_eq!(instruments.len(), 1);
+        assert_eq!(instruments[0].symbol.as_str(), "AAPL");
+        assert_eq!(instruments[0].asset_class, AssetClass::Equity);
+
+        // Verify registered in cache
+        let reg = client.registry().read().await;
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.conid_for_symbol(&instruments[0].symbol), Some(265598));
+        Ok(())
+    }
+
+    // ── Test 21: fetch_ohlcv ──
+
+    #[tokio::test]
+    async fn test_fetch_ohlcv() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+        register_aapl(&client).await?;
+
+        Mock::given(method("GET"))
+            .and(path("/iserver/marketdata/history"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"t": 1711900800, "o": 177.0, "h": 179.2, "l": 176.8, "c": 178.5, "v": 45230100.0},
+                    {"t": 1711987200, "o": 178.5, "h": 180.0, "l": 178.0, "c": 179.5, "v": 38100000.0}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let symbol = ingot_primitives::Symbol::new("AAPL")?;
+        let bars = client
+            .fetch_ohlcv(&symbol, "1d", None)
+            .await
+            .context("fetch_ohlcv should succeed")?;
+
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[0].time.timestamp(), 1_711_900_800);
+        assert_eq!(bars[0].interval.as_str(), "1d");
+        assert_eq!(bars[1].time.timestamp(), 1_711_987_200);
+        Ok(())
+    }
+
+    // ── Test 22: fetch_ticker ──
+
+    #[tokio::test]
+    async fn test_fetch_ticker() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+        register_aapl(&client).await?;
+
+        Mock::given(method("GET"))
+            .and(path("/iserver/marketdata/snapshot"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "conid": 265598,
+                    "31": "178.50",
+                    "84": "178.45",
+                    "86": "178.55",
+                    "87": "45000000"
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let symbol = ingot_primitives::Symbol::new("AAPL")?;
+        let ticker = client
+            .fetch_ticker(&symbol)
+            .await
+            .context("fetch_ticker should succeed")?;
+
+        assert_eq!(ticker.symbol.as_str(), "AAPL");
+        assert_eq!(ticker.last, Price::new(dec!(178.50)));
+        assert_eq!(ticker.bid, Price::new(dec!(178.45)));
+        assert_eq!(ticker.ask, Price::new(dec!(178.55)));
+        Ok(())
+    }
+
+    // ── Test 23: fetch_order_book ──
+
+    #[tokio::test]
+    async fn test_fetch_order_book() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+        register_aapl(&client).await?;
+
+        Mock::given(method("GET"))
+            .and(path("/iserver/marketdata/snapshot"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "conid": 265598,
+                    "84": "178.45",
+                    "86": "178.55"
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let symbol = ingot_primitives::Symbol::new("AAPL")?;
+        let book = client
+            .fetch_order_book(&symbol, 10)
+            .await
+            .context("fetch_order_book should succeed")?;
+
+        assert_eq!(book.symbol.as_str(), "AAPL");
+        assert_eq!(book.bids.len(), 1);
+        assert_eq!(book.asks.len(), 1);
+        assert_eq!(book.bids[0].price, Price::new(dec!(178.45)));
+        assert_eq!(book.asks[0].price, Price::new(dec!(178.55)));
+        Ok(())
+    }
+
+    // ── Test 24: fetch_trades_unsupported ──
+
+    #[tokio::test]
+    async fn test_fetch_trades_unsupported() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        let _ = server;
+
+        let symbol = ingot_primitives::Symbol::new("AAPL")?;
+        let result = client.fetch_trades(&symbol, None).await;
+
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.err().context("expected error")?);
+        assert!(err_msg.contains("does not support trade-level data"));
+        Ok(())
+    }
+
+    // ── Test 7: place_order_market ──
+
+    #[tokio::test]
+    async fn test_place_order_market() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+        register_aapl(&client).await?;
+
+        Mock::given(method("POST"))
+            .and(path("/iserver/account/DU_TEST/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"order_id": "12345", "order_status": "Submitted"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let request = ingot_core::OrderRequest {
+            symbol: ingot_primitives::Symbol::new("AAPL")?,
+            side: ingot_primitives::OrderSide::Buy,
+            order_type: ingot_primitives::OrderType::Market,
+            quantity: Quantity::new(dec!(100))?,
+            limit_price: None,
+            stop_price: None,
+            time_in_force: ingot_primitives::TimeInForce::Day,
+        };
+
+        let order_id = client
+            .place_order(&request)
+            .await
+            .context("place_order should succeed")?;
+
+        assert_eq!(order_id.as_str(), "12345");
+        Ok(())
+    }
+
+    // ── Test 8: place_order_limit ──
+
+    #[tokio::test]
+    async fn test_place_order_limit() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+        register_aapl(&client).await?;
+
+        Mock::given(method("POST"))
+            .and(path("/iserver/account/DU_TEST/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"order_id": "12346", "order_status": "PreSubmitted"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let request = ingot_core::OrderRequest {
+            symbol: ingot_primitives::Symbol::new("AAPL")?,
+            side: ingot_primitives::OrderSide::Buy,
+            order_type: ingot_primitives::OrderType::Limit,
+            quantity: Quantity::new(dec!(50))?,
+            limit_price: Some(Price::new(dec!(178.50))),
+            stop_price: None,
+            time_in_force: ingot_primitives::TimeInForce::GoodTilCancelled,
+        };
+
+        let order_id = client
+            .place_order(&request)
+            .await
+            .context("place_order limit should succeed")?;
+
+        assert_eq!(order_id.as_str(), "12346");
+        Ok(())
+    }
+
+    // ── Test 9: place_order_with_confirmation ──
+
+    #[tokio::test]
+    async fn test_place_order_with_confirmation() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+        register_aapl(&client).await?;
+
+        // First POST returns confirmation prompt
+        Mock::given(method("POST"))
+            .and(path("/iserver/account/DU_TEST/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "reply-abc", "message": ["Are you sure you want to submit this order?"]}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Confirmation POST returns success
+        Mock::given(method("POST"))
+            .and(path("/iserver/reply/reply-abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"order_id": "12347", "order_status": "Submitted"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let request = ingot_core::OrderRequest {
+            symbol: ingot_primitives::Symbol::new("AAPL")?,
+            side: ingot_primitives::OrderSide::Sell,
+            order_type: ingot_primitives::OrderType::Market,
+            quantity: Quantity::new(dec!(100))?,
+            limit_price: None,
+            stop_price: None,
+            time_in_force: ingot_primitives::TimeInForce::Day,
+        };
+
+        let order_id = client
+            .place_order(&request)
+            .await
+            .context("place_order with confirmation should succeed")?;
+
+        assert_eq!(order_id.as_str(), "12347");
+        Ok(())
+    }
+
+    // ── Test 10: place_order_rejected ──
+
+    #[tokio::test]
+    async fn test_place_order_rejected() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+        register_aapl(&client).await?;
+
+        Mock::given(method("POST"))
+            .and(path("/iserver/account/DU_TEST/orders"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"error": "Order rejected: insufficient margin"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let request = ingot_core::OrderRequest {
+            symbol: ingot_primitives::Symbol::new("AAPL")?,
+            side: ingot_primitives::OrderSide::Buy,
+            order_type: ingot_primitives::OrderType::Market,
+            quantity: Quantity::new(dec!(100))?,
+            limit_price: None,
+            stop_price: None,
+            time_in_force: ingot_primitives::TimeInForce::Day,
+        };
+
+        let result = client.place_order(&request).await;
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    // ── Test 11: cancel_order ──
+
+    #[tokio::test]
+    async fn test_cancel_order() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/iserver/account/DU_TEST/order/12345"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "order_id": "12345",
+                "msg": "Order 12345 has been cancelled",
+                "conid": 265598
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let order_id = ingot_core::OrderId::new("12345")?;
+        client
+            .cancel_order(&order_id)
+            .await
+            .context("cancel_order should succeed")?;
+        Ok(())
+    }
+
+    // ── Test 12: cancel_order_not_found ──
+
+    #[tokio::test]
+    async fn test_cancel_order_not_found() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/iserver/account/DU_TEST/order/99999"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_string(r#"{"error": "order not found"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let order_id = ingot_core::OrderId::new("99999")?;
+        let result = client.cancel_order(&order_id).await;
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    // ── Test 13: cancel_all_orders ──
+
+    #[tokio::test]
+    async fn test_cancel_all_orders() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/iserver/account/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "orders": [
+                    {
+                        "orderId": "111",
+                        "conid": 265598,
+                        "orderType": "LMT",
+                        "side": "BUY",
+                        "quantity": 100.0,
+                        "filledQuantity": 0.0,
+                        "remainingQuantity": 100.0,
+                        "status": "Submitted",
+                        "timeInForce": "GTC",
+                        "price": 170.0
+                    },
+                    {
+                        "orderId": "222",
+                        "conid": 265598,
+                        "orderType": "LMT",
+                        "side": "SELL",
+                        "quantity": 50.0,
+                        "filledQuantity": 0.0,
+                        "remainingQuantity": 50.0,
+                        "status": "Submitted",
+                        "timeInForce": "DAY",
+                        "price": 180.0
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/iserver/account/DU_TEST/order/111"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "order_id": "111", "msg": "cancelled"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/iserver/account/DU_TEST/order/222"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "order_id": "222", "msg": "cancelled"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let count = client
+            .cancel_all_orders()
+            .await
+            .context("cancel_all_orders should succeed")?;
+
+        assert_eq!(count, 2);
+        Ok(())
+    }
+
+    // ── Test 14: get_order_status ──
+
+    #[tokio::test]
+    async fn test_get_order_status() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+        register_aapl(&client).await?;
+
+        Mock::given(method("GET"))
+            .and(path("/iserver/account/order/status/12345"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "order_id": "12345",
+                "conid": 265598,
+                "status": "Filled",
+                "filled_quantity": 100.0,
+                "remaining_quantity": 0.0,
+                "avg_price": 178.50,
+                "side": "BUY"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let order_id = ingot_core::OrderId::new("12345")?;
+        let open = client
+            .get_order_status(&order_id)
+            .await
+            .context("get_order_status should succeed")?;
+
+        assert_eq!(open.order_id.as_str(), "12345");
+        assert_eq!(open.status, ingot_core::OrderStatus::Filled);
+        assert_eq!(open.request.symbol.as_str(), "AAPL");
+        assert_eq!(open.request.side, ingot_primitives::OrderSide::Buy);
+        // Sparse endpoint defaults
+        assert_eq!(open.request.order_type, ingot_primitives::OrderType::Market);
+        assert_eq!(
+            open.request.time_in_force,
+            ingot_primitives::TimeInForce::Day
+        );
+        assert_eq!(open.average_fill_price, Some(Price::new(dec!(178.50))));
+        Ok(())
+    }
+
+    // ── Test 15: get_open_orders ──
+
+    #[tokio::test]
+    async fn test_get_open_orders() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+        register_aapl(&client).await?;
+
+        Mock::given(method("GET"))
+            .and(path("/iserver/account/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "orders": [
+                    {
+                        "orderId": "111",
+                        "conid": 265598,
+                        "orderType": "LMT",
+                        "side": "BUY",
+                        "price": 170.0,
+                        "quantity": 100.0,
+                        "filledQuantity": 0.0,
+                        "remainingQuantity": 100.0,
+                        "status": "Submitted",
+                        "timeInForce": "GTC"
+                    },
+                    {
+                        "orderId": "222",
+                        "conid": 265598,
+                        "orderType": "MKT",
+                        "side": "SELL",
+                        "quantity": 50.0,
+                        "filledQuantity": 25.0,
+                        "remainingQuantity": 25.0,
+                        "status": "Submitted",
+                        "timeInForce": "DAY"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let orders = client
+            .get_open_orders()
+            .await
+            .context("get_open_orders should succeed")?;
+
+        assert_eq!(orders.len(), 2);
+
+        assert_eq!(orders[0].order_id.as_str(), "111");
+        assert_eq!(
+            orders[0].request.order_type,
+            ingot_primitives::OrderType::Limit
+        );
+        assert_eq!(orders[0].request.side, ingot_primitives::OrderSide::Buy);
+        assert_eq!(orders[0].request.limit_price, Some(Price::new(dec!(170.0))));
+        assert_eq!(
+            orders[0].request.time_in_force,
+            ingot_primitives::TimeInForce::GoodTilCancelled
+        );
+
+        assert_eq!(orders[1].order_id.as_str(), "222");
+        assert_eq!(
+            orders[1].request.order_type,
+            ingot_primitives::OrderType::Market
+        );
+        assert_eq!(orders[1].request.side, ingot_primitives::OrderSide::Sell);
+        assert_eq!(orders[1].filled_quantity, Quantity::new(dec!(25))?);
+        Ok(())
+    }
+
+    // ── Test 16: get_open_orders_empty ──
+
+    #[tokio::test]
+    async fn test_get_open_orders_empty() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/iserver/account/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "orders": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let orders = client
+            .get_open_orders()
+            .await
+            .context("get_open_orders_empty should succeed")?;
+
+        assert!(orders.is_empty());
         Ok(())
     }
 }

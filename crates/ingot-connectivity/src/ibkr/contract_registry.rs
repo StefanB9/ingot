@@ -47,6 +47,10 @@ impl IbkrContractRegistry {
     pub fn is_empty(&self) -> bool {
         self.conid_to_symbol.is_empty()
     }
+
+    pub fn all_instruments(&self) -> Vec<&Arc<Instrument>> {
+        self.conid_to_instrument.values().collect()
+    }
 }
 
 #[cfg(test)]
