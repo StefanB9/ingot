@@ -13,7 +13,10 @@ pub use error::AccountingError;
 pub use nav::{
     FxRateProvider, NavBreakdownEntry, NavCalculator, NavSnapshot, StaticFxRateProvider,
 };
-pub use posting::{post_adjustment, post_fill, post_funding_rate, post_transfer};
+pub use posting::{
+    post_adjustment, post_bond_coupon, post_dividend, post_fill, post_funding_rate, post_merger,
+    post_spinoff, post_stock_split, post_transfer,
+};
 pub use reconciliation::{
     Discrepancy, DiscrepancySeverity, ReconciliationResult, ReconciliationStatus, reconcile,
 };

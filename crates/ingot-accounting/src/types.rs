@@ -55,6 +55,11 @@ pub enum TransactionType {
     Interest,
     Transfer,
     Adjustment,
+    Dividend,
+    StockSplit,
+    BondCoupon,
+    Merger,
+    Spinoff,
 }
 
 impl fmt::Display for TransactionType {
@@ -66,6 +71,11 @@ impl fmt::Display for TransactionType {
             Self::Interest => f.write_str("interest"),
             Self::Transfer => f.write_str("transfer"),
             Self::Adjustment => f.write_str("adjustment"),
+            Self::Dividend => f.write_str("dividend"),
+            Self::StockSplit => f.write_str("stock_split"),
+            Self::BondCoupon => f.write_str("bond_coupon"),
+            Self::Merger => f.write_str("merger"),
+            Self::Spinoff => f.write_str("spinoff"),
         }
     }
 }
@@ -240,6 +250,32 @@ mod tests {
             TransactionType::Interest,
             TransactionType::Transfer,
             TransactionType::Adjustment,
+        ] {
+            let json = serde_json::to_string(&variant)?;
+            let deserialized: TransactionType = serde_json::from_str(&json)?;
+            assert_eq!(variant, deserialized);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_transaction_type_display_corporate_actions() {
+        assert_eq!(TransactionType::Dividend.to_string(), "dividend");
+        assert_eq!(TransactionType::StockSplit.to_string(), "stock_split");
+        assert_eq!(TransactionType::BondCoupon.to_string(), "bond_coupon");
+        assert_eq!(TransactionType::Merger.to_string(), "merger");
+        assert_eq!(TransactionType::Spinoff.to_string(), "spinoff");
+    }
+
+    #[test]
+    fn test_transaction_type_serde_roundtrip_corporate_actions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for variant in [
+            TransactionType::Dividend,
+            TransactionType::StockSplit,
+            TransactionType::BondCoupon,
+            TransactionType::Merger,
+            TransactionType::Spinoff,
         ] {
             let json = serde_json::to_string(&variant)?;
             let deserialized: TransactionType = serde_json::from_str(&json)?;

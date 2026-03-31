@@ -100,7 +100,10 @@ impl Transaction {
     /// balance check). For all other types: each currency's debits must
     /// equal credits.
     pub fn validate(&self) -> Result<(), AccountingError> {
-        if self.transaction_type == TransactionType::Trade {
+        if matches!(
+            self.transaction_type,
+            TransactionType::Trade | TransactionType::Merger
+        ) {
             return Ok(());
         }
 
@@ -346,6 +349,64 @@ mod tests {
                     AccountType::Asset,
                     EntrySide::Credit,
                     dec!(67000),
+                    Currency::USD,
+                )?,
+            ],
+            timestamp: Utc::now(),
+            reference_id: None,
+            metadata: None,
+        };
+        txn.validate()
+    }
+
+    #[test]
+    fn test_transaction_validate_merger_cross_currency() -> Result<(), AccountingError> {
+        let txn_id = TransactionId::new();
+        let txn = Transaction {
+            id: txn_id.clone(),
+            transaction_type: TransactionType::Merger,
+            entries: vec![
+                make_entry(
+                    &txn_id,
+                    AccountType::Asset,
+                    EntrySide::Debit,
+                    dec!(50),
+                    Currency::EUR,
+                )?,
+                make_entry(
+                    &txn_id,
+                    AccountType::Asset,
+                    EntrySide::Credit,
+                    dec!(100),
+                    Currency::USD,
+                )?,
+            ],
+            timestamp: Utc::now(),
+            reference_id: None,
+            metadata: None,
+        };
+        txn.validate()
+    }
+
+    #[test]
+    fn test_transaction_validate_merger_same_currency_unbalanced() -> Result<(), AccountingError> {
+        let txn_id = TransactionId::new();
+        let txn = Transaction {
+            id: txn_id.clone(),
+            transaction_type: TransactionType::Merger,
+            entries: vec![
+                make_entry(
+                    &txn_id,
+                    AccountType::Asset,
+                    EntrySide::Debit,
+                    dec!(50),
+                    Currency::USD,
+                )?,
+                make_entry(
+                    &txn_id,
+                    AccountType::Asset,
+                    EntrySide::Credit,
+                    dec!(100),
                     Currency::USD,
                 )?,
             ],
