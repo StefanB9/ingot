@@ -1,12 +1,12 @@
 use anyhow::Context;
 use chrono::{DateTime, NaiveDate, Utc};
 use ingot_core::{
-    InstrumentDetails, OhlcvBar, OpenOrder, OrderBookLevel, OrderBookSnapshot, OrderId,
-    OrderRequest, OrderStatus, TickerSnapshot,
+    Balance, InstrumentDetails, OhlcvBar, OpenOrder, OrderBookLevel, OrderBookSnapshot, OrderFill,
+    OrderId, OrderRequest, OrderStatus, Position, TickerSnapshot,
 };
 use ingot_primitives::{
-    AssetClass, Currency, Exchange, OptionRight, OptionStyle, OrderSide, OrderType, SettlementType,
-    TimeInForce,
+    Amount, AssetClass, Currency, Exchange, OptionRight, OptionStyle, OrderSide, OrderType, Price,
+    Quantity, SettlementType, TimeInForce,
 };
 use rust_decimal::Decimal;
 use smol_str::SmolStr;
@@ -15,7 +15,8 @@ use super::{
     contract_registry::IbkrContractRegistry,
     error::IbkrError,
     models::{
-        IbkrContractDetail, IbkrHistoryBar, IbkrLiveOrder, IbkrMarketSnapshot, IbkrOrderStatus,
+        IbkrAccountBalance, IbkrContractDetail, IbkrHistoryBar, IbkrLiveOrder, IbkrMarginInfo,
+        IbkrMarketSnapshot, IbkrOrderStatus, IbkrPosition, IbkrTrade,
     },
 };
 
@@ -260,12 +261,11 @@ pub(crate) fn ibkr_status_to_order_status(status: &str) -> anyhow::Result<OrderS
 
 pub(crate) fn asset_class_to_sec_type(asset_class: AssetClass) -> &'static str {
     match asset_class {
-        AssetClass::Equity => "STK",
+        AssetClass::Equity | AssetClass::CryptoSpot | AssetClass::CryptoFuture => "STK",
         AssetClass::Option => "OPT",
         AssetClass::Future => "FUT",
         AssetClass::Forex => "CASH",
         AssetClass::Bond => "BOND",
-        AssetClass::CryptoSpot | AssetClass::CryptoFuture => "STK",
     }
 }
 
@@ -480,6 +480,136 @@ fn parse_snapshot_field(s: Option<&str>, field_name: &str) -> anyhow::Result<Dec
     let val = s.with_context(|| format!("missing snapshot field: {field_name}"))?;
     val.parse()
         .with_context(|| format!("invalid {field_name}: {val}"))
+}
+
+// ── Balance mapping ──
+
+pub(crate) fn ibkr_balance_to_balance(
+    currency_key: &str,
+    bal: &IbkrAccountBalance,
+) -> anyhow::Result<Balance> {
+    let total_f64 = bal.cash_balance.unwrap_or(0.0);
+    let total = Decimal::try_from(total_f64).context("invalid cash_balance")?;
+
+    let available_f64 = bal.settled_cash.unwrap_or(total_f64);
+    let available = Decimal::try_from(available_f64).context("invalid settled_cash")?;
+
+    let held = total - available;
+
+    Ok(Balance {
+        currency: Currency::from_str_lossy(currency_key),
+        total: Amount::new(total),
+        available: Amount::new(available),
+        held: Amount::new(held),
+    })
+}
+
+// ── Position mapping ──
+
+pub(crate) fn ibkr_position_to_position(
+    pos: &IbkrPosition,
+    registry: &IbkrContractRegistry,
+) -> anyhow::Result<Position> {
+    let symbol = registry
+        .symbol_for_conid(pos.conid)
+        .with_context(|| format!("conid {} not found in registry", pos.conid))?
+        .clone();
+
+    let side = if pos.position >= 0.0 {
+        OrderSide::Buy
+    } else {
+        OrderSide::Sell
+    };
+
+    let abs_qty = pos.position.abs();
+    let quantity = Quantity::new(Decimal::try_from(abs_qty).context("invalid position quantity")?)?;
+
+    let average_entry_price =
+        Price::new(Decimal::try_from(pos.avg_cost).context("invalid avg_cost")?);
+
+    let unrealized_pnl = Some(Amount::new(
+        Decimal::try_from(pos.unrealized_pnl).context("invalid unrealized_pnl")?,
+    ));
+
+    Ok(Position {
+        symbol,
+        side,
+        quantity,
+        average_entry_price,
+        unrealized_pnl,
+        liquidation_price: None,
+    })
+}
+
+// ── Trade mapping ──
+
+pub(crate) fn ibkr_trade_to_order_fill(
+    trade: &IbkrTrade,
+    registry: &IbkrContractRegistry,
+) -> anyhow::Result<OrderFill> {
+    let symbol = registry
+        .symbol_for_conid(trade.conid)
+        .with_context(|| format!("conid {} not found in registry", trade.conid))?
+        .clone();
+
+    let order_id_str = trade.order_ref.as_deref().unwrap_or(&trade.execution_id);
+    let order_id = OrderId::new(order_id_str).context("invalid order id from trade")?;
+
+    let side = ibkr_side_to_order_side(&trade.side)?;
+    let fill_price = Price::new(Decimal::try_from(trade.price).context("invalid trade price")?);
+    let fill_quantity =
+        Quantity::new(Decimal::try_from(trade.size).context("invalid trade size")?)?;
+    let fee = Amount::new(
+        Decimal::try_from(trade.commission.unwrap_or(0.0)).context("invalid commission")?,
+    );
+    let fee_currency = Currency::from_str_lossy(&trade.currency);
+
+    let timestamp = chrono::NaiveDateTime::parse_from_str(&trade.trade_time, "%Y%m%d-%H:%M:%S")
+        .with_context(|| format!("invalid trade_time format: {}", trade.trade_time))?
+        .and_utc();
+
+    Ok(OrderFill {
+        order_id,
+        symbol,
+        side,
+        fill_price,
+        fill_quantity,
+        fee,
+        fee_currency,
+        timestamp,
+        trade_id: Some(SmolStr::new(&trade.execution_id)),
+    })
+}
+
+// ── Margin mapping ──
+
+pub(crate) fn ibkr_margin_to_snapshot(
+    account_id: &str,
+    info: &IbkrMarginInfo,
+) -> ingot_core::MarginSnapshot {
+    let extract = |field: &Option<super::models::IbkrAmountField>| -> Amount {
+        match field {
+            Some(f) => Amount::new(Decimal::try_from(f.amount).unwrap_or(Decimal::ZERO)),
+            None => Amount::new(Decimal::ZERO),
+        }
+    };
+
+    let sma = info
+        .sma
+        .as_ref()
+        .map(|f| Amount::new(Decimal::try_from(f.amount).unwrap_or(Decimal::ZERO)));
+
+    ingot_core::MarginSnapshot {
+        account_id: account_id.to_string(),
+        initial_margin: extract(&info.initial_margin),
+        maintenance_margin: extract(&info.maintenance_margin),
+        excess_liquidity: extract(&info.excess_liquidity),
+        buying_power: extract(&info.buying_power),
+        available_funds: extract(&info.available_funds),
+        net_liquidation: extract(&info.net_liquidation),
+        sma,
+        timestamp: Utc::now(),
+    }
 }
 
 #[cfg(test)]
@@ -857,6 +987,160 @@ mod tests {
             open.remaining_quantity,
             ingot_primitives::Quantity::new(dec!(50))?
         );
+        Ok(())
+    }
+
+    // ── Test: position long ──
+
+    #[test]
+    fn test_ibkr_position_to_position_long() -> anyhow::Result<()> {
+        let mut registry = crate::ibkr::contract_registry::IbkrContractRegistry::new();
+        let symbol = ingot_primitives::Symbol::new("AAPL")?;
+        let instrument = ingot_core::Instrument {
+            symbol: symbol.clone(),
+            asset_class: ingot_primitives::AssetClass::Equity,
+            exchange: ingot_primitives::Exchange::IBKR,
+            base_currency: Currency::USD,
+            quote_currency: Currency::USD,
+            tick_size: ingot_primitives::Price::new(dec!(0.01)),
+            display_name: smol_str::SmolStr::new("Apple Inc"),
+            details: ingot_core::InstrumentDetails::Equity {
+                isin: None,
+                lot_size: ingot_primitives::Quantity::new(dec!(1))?,
+                fractional: false,
+            },
+        };
+        registry.register(265598, symbol, instrument);
+
+        let pos = super::super::models::IbkrPosition {
+            conid: 265598,
+            currency: "USD".into(),
+            position: 100.0,
+            avg_cost: 175.50,
+            market_price: 180.0,
+            market_value: 18000.0,
+            unrealized_pnl: 450.0,
+        };
+
+        let result = ibkr_position_to_position(&pos, &registry)?;
+        assert_eq!(result.symbol.as_str(), "AAPL");
+        assert_eq!(result.side, OrderSide::Buy);
+        assert_eq!(result.quantity, ingot_primitives::Quantity::new(dec!(100))?);
+        assert_eq!(
+            result.average_entry_price,
+            ingot_primitives::Price::new(dec!(175.5))
+        );
+        assert_eq!(
+            result.unrealized_pnl,
+            Some(ingot_primitives::Amount::new(dec!(450)))
+        );
+        assert!(result.liquidation_price.is_none());
+        Ok(())
+    }
+
+    // ── Test: position short ──
+
+    #[test]
+    fn test_ibkr_position_to_position_short() -> anyhow::Result<()> {
+        let mut registry = crate::ibkr::contract_registry::IbkrContractRegistry::new();
+        let symbol = ingot_primitives::Symbol::new("TSLA")?;
+        let instrument = ingot_core::Instrument {
+            symbol: symbol.clone(),
+            asset_class: ingot_primitives::AssetClass::Equity,
+            exchange: ingot_primitives::Exchange::IBKR,
+            base_currency: Currency::USD,
+            quote_currency: Currency::USD,
+            tick_size: ingot_primitives::Price::new(dec!(0.01)),
+            display_name: smol_str::SmolStr::new("Tesla Inc"),
+            details: ingot_core::InstrumentDetails::Equity {
+                isin: None,
+                lot_size: ingot_primitives::Quantity::new(dec!(1))?,
+                fractional: false,
+            },
+        };
+        registry.register(76792991, symbol, instrument);
+
+        let pos = super::super::models::IbkrPosition {
+            conid: 76792991,
+            currency: "USD".into(),
+            position: -50.0,
+            avg_cost: 250.0,
+            market_price: 240.0,
+            market_value: -12000.0,
+            unrealized_pnl: 500.0,
+        };
+
+        let result = ibkr_position_to_position(&pos, &registry)?;
+        assert_eq!(result.symbol.as_str(), "TSLA");
+        assert_eq!(result.side, OrderSide::Sell);
+        assert_eq!(result.quantity, ingot_primitives::Quantity::new(dec!(50))?);
+        Ok(())
+    }
+
+    // ── Test: balance mapping ──
+
+    #[test]
+    fn test_ibkr_balance_to_balance() -> anyhow::Result<()> {
+        let bal = super::super::models::IbkrAccountBalance {
+            currency: "USD".into(),
+            settled_cash: Some(8000.0),
+            cash_balance: Some(10000.0),
+        };
+
+        let result = ibkr_balance_to_balance("USD", &bal)?;
+        assert_eq!(result.currency, Currency::USD);
+        assert_eq!(result.total.value(), dec!(10000));
+        assert_eq!(result.available.value(), dec!(8000));
+        assert_eq!(result.held.value(), dec!(2000));
+        Ok(())
+    }
+
+    // ── Test: margin to snapshot ──
+
+    #[test]
+    fn test_ibkr_margin_to_snapshot() -> anyhow::Result<()> {
+        use super::super::models::{IbkrAmountField, IbkrMarginInfo};
+
+        let info = IbkrMarginInfo {
+            initial_margin: Some(IbkrAmountField {
+                amount: 50000.0,
+                currency: Some("USD".into()),
+            }),
+            maintenance_margin: Some(IbkrAmountField {
+                amount: 30000.0,
+                currency: Some("USD".into()),
+            }),
+            excess_liquidity: Some(IbkrAmountField {
+                amount: 70000.0,
+                currency: Some("USD".into()),
+            }),
+            buying_power: Some(IbkrAmountField {
+                amount: 200000.0,
+                currency: Some("USD".into()),
+            }),
+            available_funds: Some(IbkrAmountField {
+                amount: 50000.0,
+                currency: Some("USD".into()),
+            }),
+            net_liquidation: Some(IbkrAmountField {
+                amount: 100000.0,
+                currency: Some("USD".into()),
+            }),
+            sma: Some(IbkrAmountField {
+                amount: 80000.0,
+                currency: Some("USD".into()),
+            }),
+        };
+
+        let snap = ibkr_margin_to_snapshot("U1234567", &info);
+        assert_eq!(snap.account_id, "U1234567");
+        assert_eq!(snap.initial_margin.value(), dec!(50000));
+        assert_eq!(snap.maintenance_margin.value(), dec!(30000));
+        assert_eq!(snap.excess_liquidity.value(), dec!(70000));
+        assert_eq!(snap.buying_power.value(), dec!(200000));
+        assert_eq!(snap.available_funds.value(), dec!(50000));
+        assert_eq!(snap.net_liquidation.value(), dec!(100000));
+        assert_eq!(snap.sma.map(|s| s.value()), Some(dec!(80000)));
         Ok(())
     }
 }

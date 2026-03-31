@@ -3,7 +3,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use ingot_core::{
-    Instrument, OhlcvBar, OpenOrder, OrderBookSnapshot, OrderId, Tick, TickerSnapshot,
+    Balance, Instrument, OhlcvBar, OpenOrder, OrderBookSnapshot, OrderFill, OrderId, Position,
+    Tick, TickerSnapshot,
 };
 use ingot_primitives::Symbol;
 use rust_decimal::prelude::ToPrimitive;
@@ -16,9 +17,9 @@ use super::{
     error::IbkrError,
     mapper,
     models::{
-        IbkrConfirmReply, IbkrContractDetail, IbkrContractSearchResult, IbkrHistoryResponse,
-        IbkrLiveOrdersResponse, IbkrMarketSnapshot, IbkrOrderRequest, IbkrOrderStatus,
-        IbkrOrderSubmitWrapper,
+        IbkrAccountBalance, IbkrConfirmReply, IbkrContractDetail, IbkrContractSearchResult,
+        IbkrHistoryResponse, IbkrLiveOrdersResponse, IbkrMarginInfo, IbkrMarketSnapshot,
+        IbkrOrderRequest, IbkrOrderStatus, IbkrOrderSubmitWrapper, IbkrPosition, IbkrTrade,
     },
     session::SessionManager,
 };
@@ -26,7 +27,7 @@ use crate::{
     config::IbkrConfig,
     error::ConnectivityError,
     rate_limiter::RateLimiter,
-    traits::{MarketDataProvider, OrderExecutor},
+    traits::{AccountProvider, MarketDataProvider, OrderExecutor},
 };
 
 pub(crate) struct IbkrRestClient {
@@ -579,6 +580,94 @@ impl OrderExecutor for IbkrRestClient {
     }
 }
 
+// ── AccountProvider ──
+
+impl AccountProvider for IbkrRestClient {
+    #[instrument(skip(self))]
+    async fn get_balances(&self) -> anyhow::Result<Vec<Balance>> {
+        let ledger: std::collections::HashMap<String, IbkrAccountBalance> = self
+            .get(
+                &format!("/portfolio/{}/ledger", self.config.account_id),
+                &[],
+            )
+            .await
+            .context("failed to fetch balances")?;
+
+        let mut balances = Vec::new();
+        for (currency_key, bal) in &ledger {
+            let b = mapper::ibkr_balance_to_balance(currency_key, bal)
+                .with_context(|| format!("failed to map balance for {currency_key}"))?;
+            if b.total.value() != rust_decimal::Decimal::ZERO {
+                balances.push(b);
+            }
+        }
+        Ok(balances)
+    }
+
+    #[instrument(skip(self))]
+    async fn get_positions(&self) -> anyhow::Result<Vec<Position>> {
+        let positions: Vec<IbkrPosition> = self
+            .get(
+                &format!("/portfolio/{}/positions/0", self.config.account_id),
+                &[],
+            )
+            .await
+            .context("failed to fetch positions")?;
+
+        let reg = self.registry.read().await;
+        positions
+            .iter()
+            .map(|p| mapper::ibkr_position_to_position(p, &reg))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .context("failed to map positions")
+    }
+
+    #[instrument(skip(self))]
+    async fn get_trade_history(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<Vec<OrderFill>> {
+        let trades: Vec<IbkrTrade> = self
+            .get("/iserver/account/trades", &[])
+            .await
+            .context("failed to fetch trade history")?;
+
+        let reg = self.registry.read().await;
+        let fills: Vec<OrderFill> = trades
+            .iter()
+            .map(|t| mapper::ibkr_trade_to_order_fill(t, &reg))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .context("failed to map trade history")?;
+
+        match since {
+            Some(cutoff) => Ok(fills
+                .into_iter()
+                .filter(|f| f.timestamp >= cutoff)
+                .collect()),
+            None => Ok(fills),
+        }
+    }
+}
+
+impl IbkrRestClient {
+    /// Fetch margin summary for the configured account.
+    #[instrument(skip(self))]
+    pub async fn get_margin(&self) -> anyhow::Result<ingot_core::MarginSnapshot> {
+        let info: IbkrMarginInfo = self
+            .get(
+                &format!("/portfolio/{}/summary", self.config.account_id),
+                &[],
+            )
+            .await
+            .context("failed to fetch margin summary")?;
+
+        Ok(mapper::ibkr_margin_to_snapshot(
+            &self.config.account_id,
+            &info,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -597,7 +686,7 @@ mod tests {
     use super::*;
     use crate::{
         ibkr::session::SessionManager,
-        traits::{MarketDataProvider, OrderExecutor},
+        traits::{AccountProvider, MarketDataProvider, OrderExecutor},
     };
 
     fn test_config(base_url: &str) -> IbkrConfig {
@@ -1394,6 +1483,255 @@ mod tests {
             .context("get_open_orders_empty should succeed")?;
 
         assert!(orders.is_empty());
+        Ok(())
+    }
+
+    // ── Test 25: get_balances ──
+
+    #[tokio::test]
+    async fn test_get_balances() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/portfolio/DU_TEST/ledger"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "USD": {
+                    "currency": "USD",
+                    "cashbalance": 10000.0,
+                    "settledcash": 8000.0
+                },
+                "EUR": {
+                    "currency": "EUR",
+                    "cashbalance": 0.0,
+                    "settledcash": 0.0
+                },
+                "GBP": {
+                    "currency": "GBP",
+                    "cashbalance": 5000.0,
+                    "settledcash": 5000.0
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let balances = client.get_balances().await.context("get_balances failed")?;
+
+        // EUR should be skipped (zero balance)
+        assert_eq!(balances.len(), 2);
+
+        let usd = balances
+            .iter()
+            .find(|b| b.currency == ingot_primitives::Currency::USD)
+            .context("missing USD")?;
+        assert_eq!(usd.total.value(), dec!(10000));
+        assert_eq!(usd.available.value(), dec!(8000));
+        assert_eq!(usd.held.value(), dec!(2000));
+
+        let gbp = balances
+            .iter()
+            .find(|b| b.currency == ingot_primitives::Currency::GBP)
+            .context("missing GBP")?;
+        assert_eq!(gbp.total.value(), dec!(5000));
+        assert_eq!(gbp.available.value(), dec!(5000));
+        assert_eq!(gbp.held.value(), dec!(0));
+
+        Ok(())
+    }
+
+    // ── Test 26: get_positions ──
+
+    #[tokio::test]
+    async fn test_get_positions() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+
+        // Register AAPL in the contract registry
+        {
+            let mut reg = client.registry.write().await;
+            let symbol = ingot_primitives::Symbol::new("AAPL")?;
+            let instrument = ingot_core::Instrument {
+                symbol: symbol.clone(),
+                asset_class: AssetClass::Equity,
+                exchange: Exchange::IBKR,
+                base_currency: Currency::USD,
+                quote_currency: Currency::USD,
+                tick_size: Price::new(dec!(0.01)),
+                display_name: SmolStr::new("Apple Inc"),
+                details: ingot_core::InstrumentDetails::Equity {
+                    isin: None,
+                    lot_size: Quantity::new(dec!(1))?,
+                    fractional: false,
+                },
+            };
+            reg.register(265598, symbol, instrument);
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/portfolio/DU_TEST/positions/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "conid": 265598,
+                    "currency": "USD",
+                    "position": 100.0,
+                    "avgCost": 175.50,
+                    "mktPrice": 180.0,
+                    "mktValue": 18000.0,
+                    "unrealizedPnl": 450.0
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let positions = client
+            .get_positions()
+            .await
+            .context("get_positions failed")?;
+        assert_eq!(positions.len(), 1);
+
+        let pos = &positions[0];
+        assert_eq!(pos.symbol.as_str(), "AAPL");
+        assert_eq!(pos.side, ingot_primitives::OrderSide::Buy);
+        assert_eq!(pos.quantity, Quantity::new(dec!(100))?);
+        assert_eq!(pos.average_entry_price, Price::new(dec!(175.5)));
+        assert_eq!(
+            pos.unrealized_pnl,
+            Some(ingot_primitives::Amount::new(dec!(450)))
+        );
+        assert!(pos.liquidation_price.is_none());
+
+        Ok(())
+    }
+
+    // ── Test 27: get_positions_empty ──
+
+    #[tokio::test]
+    async fn test_get_positions_empty() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/portfolio/DU_TEST/positions/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let positions = client
+            .get_positions()
+            .await
+            .context("get_positions_empty should succeed")?;
+        assert!(positions.is_empty());
+        Ok(())
+    }
+
+    // ── Test 28: get_trade_history ──
+
+    #[tokio::test]
+    async fn test_get_trade_history() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+
+        // Register AAPL
+        {
+            let mut reg = client.registry.write().await;
+            let symbol = ingot_primitives::Symbol::new("AAPL")?;
+            let instrument = ingot_core::Instrument {
+                symbol: symbol.clone(),
+                asset_class: AssetClass::Equity,
+                exchange: Exchange::IBKR,
+                base_currency: Currency::USD,
+                quote_currency: Currency::USD,
+                tick_size: Price::new(dec!(0.01)),
+                display_name: SmolStr::new("Apple Inc"),
+                details: ingot_core::InstrumentDetails::Equity {
+                    isin: None,
+                    lot_size: Quantity::new(dec!(1))?,
+                    fractional: false,
+                },
+            };
+            reg.register(265598, symbol, instrument);
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/iserver/account/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "execution_id": "EXEC001",
+                    "conid": 265598,
+                    "side": "BUY",
+                    "size": 50.0,
+                    "price": 178.25,
+                    "commission": 1.50,
+                    "currency": "USD",
+                    "trade_time": "20260329-14:30:00",
+                    "order_ref": "ORD123"
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let fills = client
+            .get_trade_history(None)
+            .await
+            .context("get_trade_history failed")?;
+        assert_eq!(fills.len(), 1);
+
+        let fill = &fills[0];
+        assert_eq!(fill.order_id.as_str(), "ORD123");
+        assert_eq!(fill.symbol.as_str(), "AAPL");
+        assert_eq!(fill.side, ingot_primitives::OrderSide::Buy);
+        assert_eq!(fill.fill_price, Price::new(dec!(178.25)));
+        assert_eq!(fill.fill_quantity, Quantity::new(dec!(50))?);
+        assert_eq!(fill.fee.value(), dec!(1.5));
+        assert_eq!(fill.fee_currency, Currency::USD);
+        assert_eq!(fill.trade_id.as_deref(), Some("EXEC001"));
+
+        Ok(())
+    }
+
+    // ── Test 29: get_margin ──
+
+    #[tokio::test]
+    async fn test_get_margin() -> anyhow::Result<()> {
+        let (server, client) = setup_rest_client().await?;
+        mount_auth_ok(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/portfolio/DU_TEST/summary"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "initmarginreq": { "amount": 50000.0, "currency": "USD" },
+                "maintmarginreq": { "amount": 30000.0, "currency": "USD" },
+                "excessliquidity": { "amount": 70000.0, "currency": "USD" },
+                "buyingpower": { "amount": 200000.0, "currency": "USD" },
+                "availablefunds": { "amount": 50000.0, "currency": "USD" },
+                "netliquidation": { "amount": 100000.0, "currency": "USD" },
+                "sma": { "amount": 80000.0, "currency": "USD" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let snap = client.get_margin().await.context("get_margin failed")?;
+
+        assert_eq!(snap.account_id, "DU_TEST");
+        assert_eq!(snap.initial_margin.value(), dec!(50000));
+        assert_eq!(snap.maintenance_margin.value(), dec!(30000));
+        assert_eq!(snap.excess_liquidity.value(), dec!(70000));
+        assert_eq!(snap.buying_power.value(), dec!(200000));
+        assert_eq!(snap.available_funds.value(), dec!(50000));
+        assert_eq!(snap.net_liquidation.value(), dec!(100000));
+        assert_eq!(snap.sma.map(|s| s.value()), Some(dec!(80000)));
+
+        // Verify computed methods
+        let util = snap.utilization()?;
+        assert_eq!(util.value(), dec!(0.5));
+        assert!(!snap.is_margin_call());
+        assert_eq!(snap.available_margin().value(), dec!(70000));
+
         Ok(())
     }
 }

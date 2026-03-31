@@ -129,6 +129,22 @@ pub(crate) struct IbkrMarginInfo {
     pub sma: Option<IbkrAmountField>,
 }
 
+/// Trade execution from GET /iserver/account/trades
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct IbkrTrade {
+    pub execution_id: String,
+    pub conid: i64,
+    pub side: String,
+    pub size: f64,
+    pub price: f64,
+    pub commission: Option<f64>,
+    pub currency: String,
+    pub trade_time: String,
+    #[serde(rename = "order_ref")]
+    pub order_ref: Option<String>,
+}
+
 /// Historical data bar from GET /iserver/marketdata/history
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
