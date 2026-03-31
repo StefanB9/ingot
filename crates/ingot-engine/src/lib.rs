@@ -8,7 +8,7 @@ pub mod strategy;
 pub mod traits;
 pub mod types;
 
-pub use config::{EngineConfig, RiskConfig, ScheduleConfig, SmartOrderConfig};
+pub use config::{EngineConfig, MarginConfig, RiskConfig, ScheduleConfig, SmartOrderConfig};
 pub use controller::PortfolioController;
 pub use engine::Engine;
 pub use error::EngineError;

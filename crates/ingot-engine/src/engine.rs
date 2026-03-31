@@ -650,6 +650,7 @@ mod tests {
             max_currency_exposure: Percentage::new(dec!(0.40))?,
             max_asset_exposure: Percentage::new(dec!(0.20))?,
             max_order_value: Amount::new(dec!(50_000)),
+            margin: None,
         })
     }
 

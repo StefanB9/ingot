@@ -1,4 +1,5 @@
 pub mod backfill;
+pub(crate) mod book_manager;
 pub mod config;
 pub mod error;
 pub mod ibkr;

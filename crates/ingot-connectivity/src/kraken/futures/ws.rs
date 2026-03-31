@@ -16,8 +16,7 @@ use super::{
     models::{FuturesWsControlMessage, FuturesWsFeed},
 };
 use crate::{
-    config::KrakenFuturesConfig,
-    kraken::{auth, book_manager::OrderBookManager},
+    book_manager::OrderBookManager, config::KrakenFuturesConfig, kraken::auth,
     traits::StreamProvider,
 };
 

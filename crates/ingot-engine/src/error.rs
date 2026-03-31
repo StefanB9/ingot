@@ -46,6 +46,18 @@ pub enum EngineError {
     #[error("schedule interval must be greater than zero")]
     InvalidScheduleInterval,
 
+    #[error("margin call: excess liquidity depleted")]
+    MarginCall,
+
+    #[error("margin utilization {utilization} exceeds maximum {limit}")]
+    MarginUtilizationExceeded {
+        utilization: Percentage,
+        limit: Percentage,
+    },
+
+    #[error("excess liquidity {available} below minimum {required}")]
+    InsufficientExcessLiquidity { available: Amount, required: Amount },
+
     #[error("connectivity error: {0}")]
     Connectivity(#[source] anyhow::Error),
 
@@ -158,6 +170,35 @@ mod tests {
             err.to_string(),
             "schedule interval must be greater than zero"
         );
+    }
+
+    #[test]
+    fn test_engine_error_display_margin_call() {
+        let err = EngineError::MarginCall;
+        assert_eq!(err.to_string(), "margin call: excess liquidity depleted");
+    }
+
+    #[test]
+    fn test_engine_error_display_margin_utilization_exceeded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let err = EngineError::MarginUtilizationExceeded {
+            utilization: Percentage::new(dec!(0.85))?,
+            limit: Percentage::new(dec!(0.80))?,
+        };
+        assert_eq!(
+            err.to_string(),
+            "margin utilization 85.00% exceeds maximum 80.00%"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_engine_error_display_insufficient_excess_liquidity() {
+        let err = EngineError::InsufficientExcessLiquidity {
+            available: Amount::new(dec!(3000)),
+            required: Amount::new(dec!(10000)),
+        };
+        assert_eq!(err.to_string(), "excess liquidity 3000 below minimum 10000");
     }
 
     #[test]
