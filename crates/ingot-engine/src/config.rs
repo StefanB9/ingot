@@ -31,6 +31,9 @@ pub struct RiskConfig {
     /// Margin monitoring thresholds. None = skip margin checks.
     #[serde(default)]
     pub margin: Option<MarginConfig>,
+    /// Derivative rollover configuration. None = no automatic rollovers.
+    #[serde(default)]
+    pub rollover: Option<crate::rollover::RolloverConfig>,
 }
 
 /// Margin monitoring configuration for accounts with margin trading.
@@ -102,6 +105,7 @@ mod tests {
             max_asset_exposure: Percentage::new(dec!(0.20))?,
             max_order_value: Amount::new(dec!(50000)),
             margin: None,
+            rollover: None,
         })
     }
 
@@ -233,6 +237,7 @@ mod tests {
                 warn_margin_utilization: Percentage::new(dec!(0.60))?,
                 min_excess_liquidity: Amount::new(dec!(5000)),
             }),
+            rollover: None,
         };
         let json = serde_json::to_string(&config_with)?;
         let deserialized: RiskConfig = serde_json::from_str(&json)?;

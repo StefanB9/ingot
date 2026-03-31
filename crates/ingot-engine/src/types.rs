@@ -1,6 +1,7 @@
 use std::fmt;
 
 use ingot_core::{MarginSnapshot, OrderBookSnapshot, OrderFill, OrderRequest, TickerSnapshot};
+use ingot_primitives::Symbol;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
@@ -61,6 +62,12 @@ pub enum EngineEvent {
     Fill(OrderFill),
     MarginUpdate(MarginSnapshot),
     ScheduleTrigger(StrategyId),
+    RolloverTriggered(crate::rollover::RolloverPlan),
+    RolloverCompleted(Symbol),
+    RolloverFailed {
+        near_symbol: Symbol,
+        reason: SmolStr,
+    },
     KillSwitch,
     Shutdown,
 }

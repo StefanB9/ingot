@@ -332,6 +332,7 @@ mod tests {
                 max_asset_exposure: Percentage::new(dec!(0.90))?,
                 max_order_value: Amount::new(dec!(90000)),
                 margin: None,
+                rollover: None,
             },
             smart_order: SmartOrderConfig {
                 use_mid_price: false,

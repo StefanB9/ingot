@@ -58,6 +58,12 @@ pub enum EngineError {
     #[error("excess liquidity {available} below minimum {required}")]
     InsufficientExcessLiquidity { available: Amount, required: Amount },
 
+    #[error("rollover: no far month contract found for {near_symbol}")]
+    RolloverFarMonthNotFound { near_symbol: Symbol },
+
+    #[error("rollover: {active} active rollovers exceeds maximum {max}")]
+    RolloverLimitExceeded { active: usize, max: usize },
+
     #[error("connectivity error: {0}")]
     Connectivity(#[source] anyhow::Error),
 
@@ -199,6 +205,28 @@ mod tests {
             required: Amount::new(dec!(10000)),
         };
         assert_eq!(err.to_string(), "excess liquidity 3000 below minimum 10000");
+    }
+
+    #[test]
+    fn test_engine_error_display_rollover_far_month_not_found()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let err = EngineError::RolloverFarMonthNotFound {
+            near_symbol: Symbol::new("ESM26")?,
+        };
+        assert_eq!(
+            err.to_string(),
+            "rollover: no far month contract found for ESM26"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_engine_error_display_rollover_limit_exceeded() {
+        let err = EngineError::RolloverLimitExceeded { active: 6, max: 5 };
+        assert_eq!(
+            err.to_string(),
+            "rollover: 6 active rollovers exceeds maximum 5"
+        );
     }
 
     #[test]

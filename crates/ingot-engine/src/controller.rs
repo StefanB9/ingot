@@ -292,6 +292,7 @@ mod tests {
             max_asset_exposure: Percentage::new(dec!(0.20))?,
             max_order_value: Amount::new(dec!(50_000)),
             margin: None,
+            rollover: None,
         })
     }
 
@@ -574,6 +575,7 @@ mod tests {
                 warn_margin_utilization: Percentage::new(dec!(0.60))?,
                 min_excess_liquidity: Amount::new(dec!(10_000)),
             }),
+            rollover: None,
         })
     }
 
@@ -703,6 +705,7 @@ mod tests {
             max_asset_exposure: Percentage::new(dec!(0.20))?,
             max_order_value: Amount::new(dec!(50_000)),
             margin: None,
+            rollover: None,
         });
         controller2.on_nav_update(Amount::new(dec!(100_000)));
 
