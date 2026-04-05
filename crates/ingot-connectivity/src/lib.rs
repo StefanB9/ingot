@@ -11,6 +11,12 @@ pub mod traits;
 pub use backfill::BackfillWorker;
 pub use config::{IbkrConfig, KrakenFuturesConfig, KrakenSpotConfig, PaperExchangeConfig};
 pub use error::ConnectivityError;
+pub use ibkr::{
+    contract_registry::IbkrContractRegistry,
+    error::IbkrError,
+    rest::IbkrRestClient,
+    tws::{Connected, Disconnected, IbkrTws},
+};
 pub use kraken::{
     futures::{KrakenFuturesRestClient, KrakenFuturesWs},
     spot::{KrakenSpotRestClient, KrakenSpotWs},

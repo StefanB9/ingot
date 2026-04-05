@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use ingot_core::Instrument;
 use ingot_primitives::Symbol;
 
-pub(crate) struct IbkrContractRegistry {
+pub struct IbkrContractRegistry {
     conid_to_symbol: HashMap<i64, Symbol>,
     symbol_to_conid: HashMap<Symbol, i64>,
     conid_to_instrument: HashMap<i64, Arc<Instrument>>,

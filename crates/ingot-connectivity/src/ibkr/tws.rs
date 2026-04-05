@@ -121,7 +121,7 @@ impl TwsInner {
 // ── IbkrTws<S> ──
 
 /// IBKR TWS binary socket client with typestate connection lifecycle.
-pub(crate) struct IbkrTws<S = Disconnected> {
+pub struct IbkrTws<S = Disconnected> {
     config: IbkrConfig,
     registry: Arc<Mutex<IbkrContractRegistry>>,
     _state: PhantomData<S>,

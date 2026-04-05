@@ -3,7 +3,7 @@ use ingot_primitives::Symbol;
 use crate::error::ConnectivityError;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum IbkrError {
+pub enum IbkrError {
     #[error("session expired, re-authentication required")]
     SessionExpired,
 

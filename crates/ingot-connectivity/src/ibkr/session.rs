@@ -78,7 +78,6 @@ impl SessionManager {
     }
 
     /// Test-only constructor: inject a plain HTTP client pointing at wiremock.
-    #[cfg(test)]
     pub fn with_client(http: Client, base_url: String) -> Self {
         Self {
             http,

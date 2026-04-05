@@ -30,7 +30,7 @@ use crate::{
     traits::{AccountProvider, MarketDataProvider, OrderExecutor},
 };
 
-pub(crate) struct IbkrRestClient {
+pub struct IbkrRestClient {
     session: SessionManager,
     config: IbkrConfig,
     registry: Arc<RwLock<IbkrContractRegistry>>,
@@ -66,6 +66,24 @@ impl IbkrRestClient {
             registry,
             rate_limiter,
         }
+    }
+
+    /// Integration-test constructor: build a client pointing at a custom base
+    /// URL.
+    #[doc(hidden)]
+    pub fn with_base_url(config: IbkrConfig, base_url: String) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .build()
+            .context("failed to build HTTP client")?;
+        let session = SessionManager::with_client(http, base_url);
+        let registry = Arc::new(RwLock::new(IbkrContractRegistry::new()));
+        let rate_limiter = RateLimiter::new(10, 1.0);
+        Ok(Self {
+            session,
+            config,
+            registry,
+            rate_limiter,
+        })
     }
 
     /// GET request with session management and 401 retry.
