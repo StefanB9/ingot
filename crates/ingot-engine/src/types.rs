@@ -1,6 +1,7 @@
 use std::fmt;
 
-use ingot_core::{OrderBookSnapshot, OrderFill, OrderRequest, TickerSnapshot};
+use ingot_core::{MarginSnapshot, OrderBookSnapshot, OrderFill, OrderRequest, TickerSnapshot};
+use ingot_primitives::Symbol;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
@@ -59,7 +60,14 @@ pub enum EngineEvent {
     Ticker(TickerSnapshot),
     OrderBook(OrderBookSnapshot),
     Fill(OrderFill),
+    MarginUpdate(MarginSnapshot),
     ScheduleTrigger(StrategyId),
+    RolloverTriggered(crate::rollover::RolloverPlan),
+    RolloverCompleted(Symbol),
+    RolloverFailed {
+        near_symbol: Symbol,
+        reason: SmolStr,
+    },
     KillSwitch,
     Shutdown,
 }
@@ -67,7 +75,7 @@ pub enum EngineEvent {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use ingot_core::OrderId;
+    use ingot_core::{MarginSnapshot, OrderId};
     use ingot_primitives::{
         Amount, Currency, OrderSide, OrderType, Price, Quantity, Symbol, TimeInForce,
     };
@@ -198,6 +206,24 @@ mod tests {
         let id = StrategyId::new("rebalancer")?;
         let event = EngineEvent::ScheduleTrigger(id);
         assert!(matches!(event, EngineEvent::ScheduleTrigger(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_engine_event_margin_update_variant() -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = MarginSnapshot {
+            account_id: "U1234567".to_string(),
+            initial_margin: Amount::new(dec!(50000)),
+            maintenance_margin: Amount::new(dec!(30000)),
+            excess_liquidity: Amount::new(dec!(50000)),
+            buying_power: Amount::new(dec!(200000)),
+            sma: None,
+            available_funds: Amount::new(dec!(70000)),
+            net_liquidation: Amount::new(dec!(100000)),
+            timestamp: Utc::now(),
+        };
+        let event = EngineEvent::MarginUpdate(snapshot);
+        assert!(matches!(event, EngineEvent::MarginUpdate(_)));
         Ok(())
     }
 

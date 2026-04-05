@@ -45,6 +45,41 @@ fn default_kraken_futures_ws_url() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IbkrConfig {
+    pub account_id: String,
+    #[serde(default = "default_ibkr_cp_gateway_url")]
+    pub cp_gateway_url: String,
+    #[serde(default = "default_ibkr_tws_host")]
+    pub tws_host: String,
+    #[serde(default = "default_ibkr_tws_port")]
+    pub tws_port: u16,
+    #[serde(default = "default_ibkr_client_id")]
+    pub client_id: i32,
+    #[serde(default = "default_ibkr_session_keepalive_secs")]
+    pub session_keepalive_secs: u64,
+}
+
+fn default_ibkr_cp_gateway_url() -> String {
+    "https://localhost:5000".into()
+}
+
+fn default_ibkr_tws_host() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_ibkr_tws_port() -> u16 {
+    7497
+}
+
+fn default_ibkr_client_id() -> i32 {
+    1
+}
+
+fn default_ibkr_session_keepalive_secs() -> u64 {
+    60
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperExchangeConfig {
     pub initial_balances: Vec<(Currency, Decimal)>,
     pub slippage_bps: Decimal,
@@ -110,6 +145,43 @@ mod tests {
             "https://futures.kraken.com/derivatives/api/v3"
         );
         assert_eq!(config.ws_url, "wss://futures.kraken.com/ws/v1");
+        Ok(())
+    }
+
+    #[test]
+    fn test_ibkr_config_serde_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let config = IbkrConfig {
+            account_id: "DU1234567".into(),
+            cp_gateway_url: default_ibkr_cp_gateway_url(),
+            tws_host: default_ibkr_tws_host(),
+            tws_port: default_ibkr_tws_port(),
+            client_id: default_ibkr_client_id(),
+            session_keepalive_secs: default_ibkr_session_keepalive_secs(),
+        };
+        let json = serde_json::to_string(&config)?;
+        let deserialized: IbkrConfig = serde_json::from_str(&json)?;
+        assert_eq!(config.account_id, deserialized.account_id);
+        assert_eq!(config.cp_gateway_url, deserialized.cp_gateway_url);
+        assert_eq!(config.tws_host, deserialized.tws_host);
+        assert_eq!(config.tws_port, deserialized.tws_port);
+        assert_eq!(config.client_id, deserialized.client_id);
+        assert_eq!(
+            config.session_keepalive_secs,
+            deserialized.session_keepalive_secs
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_ibkr_config_defaults() -> Result<(), Box<dyn std::error::Error>> {
+        let json = r#"{"account_id":"DU123"}"#;
+        let config: IbkrConfig = serde_json::from_str(json)?;
+        assert_eq!(config.account_id, "DU123");
+        assert_eq!(config.cp_gateway_url, "https://localhost:5000");
+        assert_eq!(config.tws_host, "127.0.0.1");
+        assert_eq!(config.tws_port, 7497);
+        assert_eq!(config.client_id, 1);
+        assert_eq!(config.session_keepalive_secs, 60);
         Ok(())
     }
 

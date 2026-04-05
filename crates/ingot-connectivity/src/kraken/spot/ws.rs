@@ -16,9 +16,7 @@ use super::{
     models::{KrakenWsBookData, KrakenWsMessage, KrakenWsMethodResponse},
     rest::KrakenSpotRestClient,
 };
-use crate::{
-    config::KrakenSpotConfig, kraken::book_manager::OrderBookManager, traits::StreamProvider,
-};
+use crate::{book_manager::OrderBookManager, config::KrakenSpotConfig, traits::StreamProvider};
 
 // ---- Typestate types ----
 

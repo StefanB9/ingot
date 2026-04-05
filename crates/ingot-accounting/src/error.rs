@@ -24,6 +24,9 @@ pub enum AccountingError {
 
     #[error("reconciliation failed for {exchange}: {reason}")]
     ReconciliationFailed { exchange: Exchange, reason: String },
+
+    #[error("invalid corporate action: {reason}")]
+    InvalidCorporateAction { reason: String },
 }
 
 #[cfg(test)]
@@ -88,5 +91,16 @@ mod tests {
             reason: "timeout".into(),
         };
         assert_eq!(err.to_string(), "reconciliation failed for Kraken: timeout");
+    }
+
+    #[test]
+    fn test_error_display_invalid_corporate_action() {
+        let err = AccountingError::InvalidCorporateAction {
+            reason: "stock split old_qty must differ from new_qty".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid corporate action: stock split old_qty must differ from new_qty"
+        );
     }
 }

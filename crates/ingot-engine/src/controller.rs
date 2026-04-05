@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ingot_core::{OrderFill, Position, TickerSnapshot};
+use ingot_core::{MarginSnapshot, OrderFill, Position, TickerSnapshot};
 use ingot_primitives::{Amount, OrderSide, OrderType, Symbol};
 use rust_decimal::Decimal;
 use smol_str::SmolStr;
@@ -17,6 +17,7 @@ pub struct PortfolioController {
     positions: HashMap<Symbol, Position>,
     current_nav: Amount,
     halted: bool,
+    latest_margin: Option<MarginSnapshot>,
 }
 
 impl PortfolioController {
@@ -26,6 +27,7 @@ impl PortfolioController {
             positions: HashMap::new(),
             current_nav: Amount::zero(),
             halted: false,
+            latest_margin: None,
         }
     }
 
@@ -55,6 +57,36 @@ impl PortfolioController {
                     self.current_nav, self.config.global_stop_loss
                 )),
             };
+        }
+
+        // 2.5. Margin checks (if configured)
+        if let Some(ref margin_config) = self.config.margin {
+            if let Some(ref snapshot) = self.latest_margin {
+                if snapshot.is_margin_call() {
+                    self.halted = true;
+                    return RiskDecision::Rejected {
+                        reason: SmolStr::new("margin call — excess liquidity depleted"),
+                    };
+                }
+                if let Ok(util) = snapshot.utilization() {
+                    if util > margin_config.max_margin_utilization {
+                        return RiskDecision::Rejected {
+                            reason: SmolStr::new(format!(
+                                "margin utilization {} exceeds max {}",
+                                util, margin_config.max_margin_utilization
+                            )),
+                        };
+                    }
+                }
+                if snapshot.excess_liquidity < margin_config.min_excess_liquidity {
+                    return RiskDecision::Rejected {
+                        reason: SmolStr::new(format!(
+                            "excess liquidity {} below minimum {}",
+                            snapshot.excess_liquidity, margin_config.min_excess_liquidity
+                        )),
+                    };
+                }
+            }
         }
 
         // 3. Resolve order price
@@ -164,6 +196,31 @@ impl PortfolioController {
         }
     }
 
+    /// Update the latest margin snapshot. Auto-halts on margin call.
+    pub fn on_margin_update(&mut self, snapshot: MarginSnapshot) {
+        if snapshot.is_margin_call() {
+            tracing::warn!("margin call detected — auto-halting controller");
+            self.halted = true;
+        }
+        if let Some(ref margin_config) = self.config.margin {
+            if let Ok(util) = snapshot.utilization() {
+                if util > margin_config.warn_margin_utilization {
+                    tracing::warn!(
+                        "margin utilization {} exceeds warning threshold {}",
+                        util,
+                        margin_config.warn_margin_utilization
+                    );
+                }
+            }
+        }
+        self.latest_margin = Some(snapshot);
+    }
+
+    /// Read-only access to the latest margin snapshot.
+    pub fn latest_margin(&self) -> Option<&MarginSnapshot> {
+        self.latest_margin.as_ref()
+    }
+
     /// Manually halt the controller (e.g., from kill switch).
     pub fn halt(&mut self) {
         self.halted = true;
@@ -218,7 +275,7 @@ mod tests {
     use std::collections::HashMap;
 
     use chrono::Utc;
-    use ingot_core::{OrderFill, OrderId, OrderRequest, Position, TickerSnapshot};
+    use ingot_core::{MarginSnapshot, OrderFill, OrderId, OrderRequest, Position, TickerSnapshot};
     use ingot_primitives::{
         Amount, Currency, OrderSide, OrderType, Percentage, Price, Quantity, Symbol, TimeInForce,
     };
@@ -234,6 +291,8 @@ mod tests {
             max_currency_exposure: Percentage::new(dec!(0.40))?,
             max_asset_exposure: Percentage::new(dec!(0.20))?,
             max_order_value: Amount::new(dec!(50_000)),
+            margin: None,
+            rollover: None,
         })
     }
 
@@ -503,6 +562,165 @@ mod tests {
         Ok(())
     }
 
+    // ── Margin tests ───────────────────────────────────────────────────
+
+    fn sample_margin_risk_config() -> Result<RiskConfig, Box<dyn std::error::Error>> {
+        Ok(RiskConfig {
+            global_stop_loss: Amount::new(dec!(10_000)),
+            max_currency_exposure: Percentage::new(dec!(0.40))?,
+            max_asset_exposure: Percentage::new(dec!(0.20))?,
+            max_order_value: Amount::new(dec!(50_000)),
+            margin: Some(crate::config::MarginConfig {
+                max_margin_utilization: Percentage::new(dec!(0.80))?,
+                warn_margin_utilization: Percentage::new(dec!(0.60))?,
+                min_excess_liquidity: Amount::new(dec!(10_000)),
+            }),
+            rollover: None,
+        })
+    }
+
+    fn sample_margin_snapshot(
+        initial_margin: Decimal,
+        net_liquidation: Decimal,
+        excess_liquidity: Decimal,
+    ) -> MarginSnapshot {
+        MarginSnapshot {
+            account_id: "U1234567".to_string(),
+            initial_margin: Amount::new(initial_margin),
+            maintenance_margin: Amount::new(dec!(30_000)),
+            excess_liquidity: Amount::new(excess_liquidity),
+            buying_power: Amount::new(dec!(200_000)),
+            sma: None,
+            available_funds: Amount::new(dec!(70_000)),
+            net_liquidation: Amount::new(net_liquidation),
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_on_margin_update_stores_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_margin_risk_config()?;
+        let mut controller = PortfolioController::new(config);
+        assert!(controller.latest_margin().is_none());
+
+        let snapshot = sample_margin_snapshot(dec!(50_000), dec!(100_000), dec!(50_000));
+        controller.on_margin_update(snapshot.clone());
+
+        assert!(controller.latest_margin().is_some());
+        assert_eq!(controller.latest_margin(), Some(&snapshot));
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_intention_approved_with_margin_headroom() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let config = sample_margin_risk_config()?;
+        let mut controller = PortfolioController::new(config);
+        controller.on_nav_update(Amount::new(dec!(100_000)));
+
+        // 50% utilization, well within 80% max; 50k excess > 10k min
+        let snapshot = sample_margin_snapshot(dec!(50_000), dec!(100_000), dec!(50_000));
+        controller.on_margin_update(snapshot);
+
+        let intention = make_small_limit_buy()?;
+        let tickers = HashMap::new();
+        let decision = controller.check_intention(&intention, &tickers);
+        assert_eq!(decision, RiskDecision::Approved);
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_intention_rejected_margin_utilization() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let config = sample_margin_risk_config()?; // max = 80%
+        let mut controller = PortfolioController::new(config);
+        controller.on_nav_update(Amount::new(dec!(100_000)));
+
+        // 85% utilization > 80% max
+        let snapshot = sample_margin_snapshot(dec!(85_000), dec!(100_000), dec!(15_000));
+        controller.on_margin_update(snapshot);
+
+        let intention = make_small_limit_buy()?;
+        let tickers = HashMap::new();
+        let decision = controller.check_intention(&intention, &tickers);
+        assert!(matches!(
+            decision,
+            RiskDecision::Rejected { ref reason } if reason.contains("margin utilization")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_intention_rejected_low_excess_liquidity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let config = sample_margin_risk_config()?; // min excess = 10_000
+        let mut controller = PortfolioController::new(config);
+        controller.on_nav_update(Amount::new(dec!(100_000)));
+
+        // 50% utilization (within limit), but only 5k excess < 10k min
+        let snapshot = sample_margin_snapshot(dec!(50_000), dec!(100_000), dec!(5_000));
+        controller.on_margin_update(snapshot);
+
+        let intention = make_small_limit_buy()?;
+        let tickers = HashMap::new();
+        let decision = controller.check_intention(&intention, &tickers);
+        assert!(matches!(
+            decision,
+            RiskDecision::Rejected { ref reason } if reason.contains("excess liquidity")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_margin_update_auto_halts_on_margin_call() -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_margin_risk_config()?;
+        let mut controller = PortfolioController::new(config);
+        assert!(!controller.is_halted());
+
+        // Excess liquidity <= 0 → margin call
+        let snapshot = sample_margin_snapshot(dec!(95_000), dec!(100_000), dec!(-500));
+        controller.on_margin_update(snapshot);
+
+        assert!(controller.is_halted());
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_margin_config_skips_margin_check() -> Result<(), Box<dyn std::error::Error>> {
+        let config = sample_risk_config()?; // margin: None
+        let mut controller = PortfolioController::new(config);
+        controller.on_nav_update(Amount::new(dec!(100_000)));
+
+        // Feed a margin snapshot with terrible numbers
+        let snapshot = sample_margin_snapshot(dec!(95_000), dec!(100_000), dec!(-500));
+        controller.on_margin_update(snapshot);
+
+        // Note: on_margin_update auto-halts on margin call regardless of config.
+        // But check_intention's margin block is skipped when config.margin is None.
+        // Since on_margin_update halts, we need a non-margin-call snapshot to test
+        // skip.
+        let mut controller2 = PortfolioController::new(RiskConfig {
+            global_stop_loss: Amount::new(dec!(10_000)),
+            max_currency_exposure: Percentage::new(dec!(0.40))?,
+            max_asset_exposure: Percentage::new(dec!(0.20))?,
+            max_order_value: Amount::new(dec!(50_000)),
+            margin: None,
+            rollover: None,
+        });
+        controller2.on_nav_update(Amount::new(dec!(100_000)));
+
+        // 95% utilization — would be rejected with margin config, but config.margin is
+        // None
+        let snapshot2 = sample_margin_snapshot(dec!(95_000), dec!(100_000), dec!(5_000));
+        controller2.on_margin_update(snapshot2);
+
+        let intention = make_small_limit_buy()?;
+        let tickers = HashMap::new();
+        let decision = controller2.check_intention(&intention, &tickers);
+        assert_eq!(decision, RiskDecision::Approved);
+        Ok(())
+    }
+
     // ── Property-based tests ───────────────────────────────────────────
 
     mod proptests {
@@ -635,6 +853,55 @@ mod tests {
                         prop_assert!(is_rejected);
                     }
                 }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+
+            #[test]
+            fn prop_test_margin_check_never_approves_above_limit(
+                utilization_pct in 81i64..=100,
+                net_liq in 100_000i64..=500_000,
+            ) {
+                let config = sample_margin_risk_config()
+                    .map_err(|e| TestCaseError::Fail(format!("{e}").into()))?;
+                let mut controller = PortfolioController::new(config);
+                let nav = Amount::new(Decimal::from(net_liq));
+                controller.on_nav_update(nav);
+
+                let net = Decimal::from(net_liq);
+                let init = net * Decimal::from(utilization_pct) / dec!(100);
+                let excess = net - init;
+
+                let snapshot = sample_margin_snapshot(init, net, excess);
+                controller.on_margin_update(snapshot);
+
+                let intention = OrderIntention {
+                    strategy_id: StrategyId::new("prop")
+                        .map_err(|e| TestCaseError::Fail(format!("{e}").into()))?,
+                    request: OrderRequest {
+                        symbol: Symbol::new("XXBTZUSD")
+                            .map_err(|e| TestCaseError::Fail(format!("{e}").into()))?,
+                        side: OrderSide::Buy,
+                        order_type: OrderType::Limit,
+                        quantity: Quantity::new(dec!(0.001))
+                            .map_err(|e| TestCaseError::Fail(format!("{e}").into()))?,
+                        limit_price: Some(Price::new(dec!(67_000))),
+                        stop_price: None,
+                        time_in_force: TimeInForce::GoodTilCancelled,
+                    },
+                    reason: None,
+                };
+
+                let tickers = HashMap::new();
+                let decision = controller.check_intention(&intention, &tickers);
+                prop_assert!(
+                    matches!(decision, RiskDecision::Rejected { .. }),
+                    "expected rejection for utilization {}%, got {:?}",
+                    utilization_pct,
+                    decision
+                );
             }
         }
     }

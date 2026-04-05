@@ -28,6 +28,26 @@ pub struct RiskConfig {
     pub max_asset_exposure: Percentage,
     /// Maximum single order size (quote currency value).
     pub max_order_value: Amount,
+    /// Margin monitoring thresholds. None = skip margin checks.
+    #[serde(default)]
+    pub margin: Option<MarginConfig>,
+    /// Derivative rollover configuration. None = no automatic rollovers.
+    #[serde(default)]
+    pub rollover: Option<crate::rollover::RolloverConfig>,
+}
+
+/// Margin monitoring configuration for accounts with margin trading.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarginConfig {
+    /// Maximum allowed margin utilization (e.g., 0.80 = 80%).
+    /// Orders rejected if utilization would exceed this.
+    pub max_margin_utilization: Percentage,
+    /// Warning threshold for margin utilization (e.g., 0.60 = 60%).
+    /// Logged at warn level when exceeded but orders not rejected.
+    pub warn_margin_utilization: Percentage,
+    /// Minimum required excess liquidity.
+    /// Orders rejected if excess liquidity below this.
+    pub min_excess_liquidity: Amount,
 }
 
 /// Configuration for smart limit order pricing.
@@ -84,6 +104,8 @@ mod tests {
             max_currency_exposure: Percentage::new(dec!(0.40))?,
             max_asset_exposure: Percentage::new(dec!(0.20))?,
             max_order_value: Amount::new(dec!(50000)),
+            margin: None,
+            rollover: None,
         })
     }
 
@@ -176,6 +198,62 @@ mod tests {
         let deserialized: ScheduleConfig = serde_json::from_str(&json)?;
         assert_eq!(deserialized.strategy_id, config.strategy_id);
         assert_eq!(deserialized.interval_ms, 10_000);
+        Ok(())
+    }
+
+    // ── MarginConfig ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_margin_config_serde_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let config = MarginConfig {
+            max_margin_utilization: Percentage::new(dec!(0.80))?,
+            warn_margin_utilization: Percentage::new(dec!(0.60))?,
+            min_excess_liquidity: Amount::new(dec!(10000)),
+        };
+        let json = serde_json::to_string(&config)?;
+        let deserialized: MarginConfig = serde_json::from_str(&json)?;
+        assert_eq!(
+            deserialized.max_margin_utilization,
+            Percentage::new(dec!(0.80))?
+        );
+        assert_eq!(
+            deserialized.warn_margin_utilization,
+            Percentage::new(dec!(0.60))?
+        );
+        assert_eq!(deserialized.min_excess_liquidity, Amount::new(dec!(10000)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_risk_config_with_margin_serde() -> Result<(), Box<dyn std::error::Error>> {
+        // With margin config
+        let config_with = RiskConfig {
+            global_stop_loss: Amount::new(dec!(10000)),
+            max_currency_exposure: Percentage::new(dec!(0.40))?,
+            max_asset_exposure: Percentage::new(dec!(0.20))?,
+            max_order_value: Amount::new(dec!(50000)),
+            margin: Some(MarginConfig {
+                max_margin_utilization: Percentage::new(dec!(0.80))?,
+                warn_margin_utilization: Percentage::new(dec!(0.60))?,
+                min_excess_liquidity: Amount::new(dec!(5000)),
+            }),
+            rollover: None,
+        };
+        let json = serde_json::to_string(&config_with)?;
+        let deserialized: RiskConfig = serde_json::from_str(&json)?;
+        assert!(deserialized.margin.is_some());
+
+        // Without margin config (None)
+        let config_without = sample_risk_config()?;
+        let json = serde_json::to_string(&config_without)?;
+        let deserialized: RiskConfig = serde_json::from_str(&json)?;
+        assert!(deserialized.margin.is_none());
+
+        // Without margin field at all (serde default)
+        let json_no_field = r#"{"global_stop_loss":"10000","max_currency_exposure":"0.40","max_asset_exposure":"0.20","max_order_value":"50000"}"#;
+        let deserialized: RiskConfig = serde_json::from_str(json_no_field)?;
+        assert!(deserialized.margin.is_none());
+
         Ok(())
     }
 }
